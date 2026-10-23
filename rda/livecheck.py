@@ -196,8 +196,9 @@ def run(w):
             mism.append(f"{len(all_ads - uploaded)} ads in Google Ads not in the database")
         if uploaded - all_ads:
             mism.append(f"{len(uploaded - all_ads)} ads in the database not found in Google Ads")
-        for g in con.execute("SELECT adgroup_res FROM adgroups WHERE alcohol=1 AND "
-                             "adgroup_res IS NOT NULL").fetchall():
+        for g in con.execute("SELECT g.adgroup_res FROM adgroups g JOIN campaigns c ON "
+                             "g.campaign_key=c.key WHERE g.alcohol=1 AND g.adgroup_res IS NOT "
+                             "NULL AND c.status!='removed'").fetchall():
             if not excl.get(g["adgroup_res"]):
                 mism.append(f"alcohol ad group {g['adgroup_res']} has no 18-24 exclusion")
         from .gads import asset_name

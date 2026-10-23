@@ -611,3 +611,20 @@ def test_model_label_added_to_existing_campaigns():
         con.execute("UPDATE campaigns SET labels_done=?", (json.dumps(["Ponly Cook", "P"]),))
         assert ads.add_missing_labels() == 1
         assert con.execute("SELECT label_attempts FROM campaigns").fetchone()[0] == 0
+
+
+def test_live_check_ignores_removed_campaigns():
+    from rda import livecheck
+    with tempfile.TemporaryDirectory() as tmp:
+        con, ads, stub, logos = setup(tmp)
+        drive(ads, logos)
+        # an alcohol ad group of a removed campaign (no exclusion in Google Ads any more)
+        con.execute("INSERT INTO campaigns(key,wave,pool,nn,theme,name,n,campaign_res,status) "
+                    "VALUES('old',-1,'P',9,'T','OLD',2,'customers/1/campaigns/777','removed')")
+        con.execute("INSERT INTO adgroups(key,campaign_key,nn,theme,name,n,alcohol,adgroup_res) "
+                    "VALUES('oldg','old',1,'T','G',2,1,'customers/1/adGroups/778')")
+        w = _live_worker(con, ads)
+        livecheck.run(w)
+        res = db.kv_get(con, "live_check")["results"]
+        dupline = next(r for r in res if "duplicates" in r)
+        assert dupline.startswith("OK") and "778" not in dupline, dupline
