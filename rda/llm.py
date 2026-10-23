@@ -100,7 +100,9 @@ class Claude:
         self.c = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
 
     def sync_json(self, params):
-        r = self.c.messages.create(**params)
+        # streaming: the SDK refuses large max_tokens on non-streaming calls
+        with self.c.messages.stream(**params) as stream:
+            r = stream.get_final_message()
         text = next(b.text for b in r.content if b.type == "text")
         return json.loads(text)
 
@@ -127,13 +129,14 @@ class Claude:
         return out
 
 
-def build_themes(claude, category, titles):
+def build_themes(claude, category, titles, cache=None):
     """Two steps: fixed theme list from all titles, then each title gets a theme.
     Chunks stay well under the 100k-token long-prompt price tier."""
     n = len(titles)
     target = max(1, round(n / 10))
     listing = "\n".join(titles)
-    themes = claude.sync_json(_params(
+    cached = cache.get(category) if cache is not None else None
+    themes = cached or claude.sync_json(_params(
         f"""Here are {n} recipe titles from the category "{category}".
 Create about {target} themes that group similar recipes (by main ingredient, dish type or
 flavour). Each theme name: 2-4 words, at most 28 characters, Title Case, no numbers,
@@ -141,6 +144,8 @@ no punctuation except '&'. Themes must not overlap.
 
 {listing}""", THEMES_SCHEMA, 8000))["themes"]
     themes = [t.strip()[:28] for t in themes if t.strip()] or ["Recipes"]
+    if cache is not None:
+        cache[category] = themes
     assigned = {}
     per = 1500  # titles per assignment call (~20k tokens)
     for start in range(0, n, per):

@@ -133,7 +133,12 @@ class Worker:
             if con.execute("SELECT 1 FROM themes WHERE category=?", (pool,)).fetchone():
                 continue
             self.log(f"themes: {pool} ({len(items)} articles)")
-            themes, assigned = llm.build_themes(self.claude, pool, [r["title"] for r in items])
+            cache = db.kv_get(con, "theme_lists", {})
+            try:
+                themes, assigned = llm.build_themes(self.claude, pool,
+                                                    [r["title"] for r in items], cache)
+            finally:
+                db.kv_set(con, "theme_lists", cache)   # never pay twice for a theme list
             for r, t in zip(items, assigned):
                 db.update_article(con, r["id"], theme=t, status="themed")
             con.execute("INSERT OR REPLACE INTO themes VALUES(?,?)", (pool, json.dumps(themes)))
