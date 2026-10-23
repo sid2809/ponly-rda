@@ -42,8 +42,10 @@ BUSINESS_NAME = "Leapfour Media Pvt Ltd"
 DOMAIN_PREFIX = "https://ponly.com/"
 BUDGET_PER_ARTICLE_INR = 300
 MAX_CPC_INR = 2
-CAMPAIGN_MIN, CAMPAIGN_MAX = 8, 12
-POOL_ONE_CAMPAIGN_RANGE = (13, 15)
+# Siddharth 23 Oct: 6-8 articles per campaign, 2-4 articles per ad group.
+# Leftovers: under 6 -> one campaign; 9-11 -> one campaign; 17 -> 9 + 8.
+CAMPAIGN_MIN, CAMPAIGN_MAX = 6, 8
+ADGROUP_MIN, ADGROUP_MAX = 2, 4
 GEO_US = "geoTargetConstants/2840"
 LANG_EN = "languageConstants/1000"
 UTM_SUFFIX = ("utm_source=google&utm_medium=display&utm_campaign={campaignid}"

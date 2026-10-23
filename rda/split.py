@@ -29,12 +29,14 @@ def pool_of(a):
 
 
 def campaign_sizes(n):
-    """8-12 per campaign; 13-15 -> one campaign; under 8 -> one campaign (Siddharth)."""
+    """6-8 per campaign. Counts that cannot split into 6-8 (Siddharth, 23 Oct):
+    under 6 -> one campaign; 9-11 -> one campaign; 17 -> 9 + 8."""
     if n <= 0:
         return []
-    lo, hi = config.POOL_ONE_CAMPAIGN_RANGE
-    if n < config.CAMPAIGN_MIN or lo <= n <= hi or n <= config.CAMPAIGN_MAX:
+    if n < config.CAMPAIGN_MIN or n <= config.CAMPAIGN_MAX or 9 <= n <= 11:
         return [n]
+    if n == 17:
+        return [9, 8]
     k = math.ceil(n / config.CAMPAIGN_MAX)
     base, extra = divmod(n, k)
     sizes = [base + 1] * extra + [base] * (k - extra)
@@ -42,17 +44,36 @@ def campaign_sizes(n):
     return sizes
 
 
+def adgroup_split(themes):
+    """Split a campaign's articles (sorted by theme) into ad groups of 2-4, keeping
+    same-theme articles together where possible. themes: list of theme per article.
+    Returns list of group sizes. A 1-article campaign is one ad group of 1."""
+    m = len(themes)
+    if m <= config.ADGROUP_MIN:
+        return [m] if m else []
+    INF = float("inf")
+    best = [(INF, None)] * (m + 1)   # best[i] = (cost, prev) for first i articles
+    best[0] = (0, None)
+    for i in range(1, m + 1):
+        for size in range(config.ADGROUP_MIN, config.ADGROUP_MAX + 1):
+            j = i - size
+            if j < 0 or best[j][0] == INF:
+                continue
+            mixed = len(set(themes[j:i])) - 1          # theme changes inside the group
+            cost = best[j][0] + mixed * 10 + 1          # avoid mixing first, then fewer groups
+            if cost < best[i][0]:
+                best[i] = (cost, j)
+    sizes, i = [], m
+    while i > 0:
+        j = best[i][1]
+        sizes.append(i - j)
+        i = j
+    return sizes[::-1]
+
+
 def adgroup_sizes(m):
-    """3-4 per ad group; 1, 2 or 5 articles -> one ad group (Siddharth, 22 Oct)."""
-    if m in (1, 2, 5) or m <= 0:
-        return [m] if m > 0 else []
-    if m in (3, 4):
-        return [m]
-    g = math.ceil(m / 4)
-    base, extra = divmod(m, g)
-    sizes = [base + 1] * extra + [base] * (g - extra)
-    assert all(3 <= s <= 4 for s in sizes), (m, sizes)
-    return sizes
+    """Sizes for m articles of one theme (used in tests and estimates)."""
+    return adgroup_split(["t"] * m)
 
 
 def chunk(items, sizes):
@@ -111,7 +132,8 @@ def plan_campaigns(articles, start_nn):
             theme = Counter(a["theme"] for a in c_items).most_common(1)[0][0]
             name = f"{pool} | {theme} | {nn:02d} | {len(c_items)} articles"
             ags = []
-            for j, g in enumerate(chunk(c_items, adgroup_sizes(len(c_items))), 1):
+            ag_sizes = adgroup_split([a["theme"] for a in c_items])
+            for j, g in enumerate(chunk(c_items, ag_sizes), 1):
                 gt = Counter(a["theme"] for a in g).most_common(1)[0][0]
                 ags.append({"nn": j, "theme": gt, "articles": g,
                             "name": f"{gt} | AG{j:02d} | {len(g)} articles"})

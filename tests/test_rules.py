@@ -50,18 +50,22 @@ def test_lint_catches():
 
 def test_campaign_sizes():
     assert split.campaign_sizes(5) == [5]
-    assert split.campaign_sizes(9) == [9]
-    assert split.campaign_sizes(13) == [13] and split.campaign_sizes(15) == [15]
-    for n in range(16, 900):
+    assert split.campaign_sizes(9) == [9] and split.campaign_sizes(11) == [11]
+    assert split.campaign_sizes(17) == [9, 8]
+    assert split.campaign_sizes(12) == [6, 6]
+    for n in list(range(6, 9)) + list(range(12, 17)) + list(range(18, 900)):
         s = split.campaign_sizes(n)
-        assert sum(s) == n and all(8 <= x <= 12 for x in s), (n, s)
+        assert sum(s) == n and all(6 <= x <= 8 for x in s), (n, s)
 
 
-def test_adgroup_sizes():
-    assert split.adgroup_sizes(5) == [5] and split.adgroup_sizes(2) == [2]
-    for m in [3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]:
+def test_adgroup_split():
+    for m in range(2, 12):
         s = split.adgroup_sizes(m)
-        assert sum(s) == m and all(3 <= x <= 4 for x in s), (m, s)
+        assert sum(s) == m and all(2 <= x <= 4 for x in s), (m, s)
+    assert split.adgroup_sizes(1) == [1]
+    # keeps themes together: 3 A + 3 B -> 3 + 3, not 4 + 2
+    assert split.adgroup_split(["A"] * 3 + ["B"] * 3) == [3, 3]
+    assert split.adgroup_split(["A"] * 2 + ["B"] * 2 + ["C"] * 4) == [2, 2, 4]
 
 
 def test_crops_any_size():
