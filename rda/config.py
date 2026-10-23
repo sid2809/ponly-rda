@@ -70,7 +70,9 @@ BYTES_PER_ADD_REQUEST = 9_000_000   # v26 REQUEST_TOO_LARGE limit is 10,484,504 
 EXPLORER_QUOTA_CAP = 2700
 LEASE_STALE_S = 900
 SHEETS_MIN_WRITE_INTERVAL_S = 120
+OUTPUT_MIN_WRITE_INTERVAL_S = 900   # the big Output tab: only when changed, max every 15 min
 LOOP_SLEEP_S = 60
 # Siddharth 23 Oct: wait 20-30 s between Replicate image requests (rate limit)
 IMAGE_GAP_S = (20, 30)
 IMAGE_STEP_BUDGET_S = 60   # max time one loop spends starting images
+MIN_FREE_DISK_BYTES = 1 * 2**30   # no new paid image below 1 GB free on the volume

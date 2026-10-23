@@ -4,3 +4,10 @@ data_csv/
 *.sqlite*
 .env
 *.json.key
+# never commit keys or credential files (service-account keys are JSON)
+*.json
+*.pem
+*.p12
+*credentials*
+*secret*
+!railway.json

@@ -29,7 +29,8 @@ SETTINGS_DEFAULTS = [
 OUTPUT_HEADER = ["ID", "Category", "Title", "Final URL", "Alcohol", "Alcohol reason", "Wave",
                  "Image model", "Campaign", "Ad group", "Status", "Error / skip reason",
                  "Approval", "Policy note", "Campaign ID", "Ad ID", "Impressions", "Clicks",
-                 "Regeneration cost ($)", "Note"]
+                 "Regeneration cost ($)", "Note", "Review status", "Image/text policy",
+                 "Cost (Rs)"]
 
 
 class Sheet:
@@ -106,6 +107,7 @@ class Sheet:
         now = time.time()
         if not force and now - self._last_write.get(tab, 0) < config.SHEETS_MIN_WRITE_INTERVAL_S:
             return False
+        self._last_write[tab] = now          # also after a failure: no retry storm every loop
         self._call(self.svc.spreadsheets().values().update(
             spreadsheetId=self.sid, range=f"'{tab}'!A1", valueInputOption="RAW",
             body={"values": rows}))

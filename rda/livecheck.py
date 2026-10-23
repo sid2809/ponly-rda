@@ -181,10 +181,12 @@ def run(w):
                 for u in x.ad_group_ad.ad.final_urls:
                     ads_per.setdefault((x.ad_group.resource_name, u), []).append(
                         x.ad_group_ad.resource_name)
-            for x in ads.search("SELECT ad_group.resource_name FROM ad_group_criterion WHERE "
-                                f"ad_group.resource_name IN ({q}) AND "
-                                "ad_group_criterion.type = 'AGE_RANGE' AND "
+            for x in ads.search("SELECT ad_group.resource_name, ad_group_criterion.age_range.type "
+                                f"FROM ad_group_criterion WHERE ad_group.resource_name IN ({q}) "
+                                "AND ad_group_criterion.type = 'AGE_RANGE' AND "
                                 "ad_group_criterion.negative = TRUE", "livecheck"):
+                if x.ad_group_criterion.age_range.type_.name != "AGE_RANGE_18_24":
+                    continue
                 k = x.ad_group.resource_name
                 excl[k] = excl.get(k, 0) + 1
         dup += [f"ad x{len(v)} for {u}" for (g, u), v in ads_per.items() if len(v) > 1]
@@ -219,7 +221,7 @@ def run(w):
 
     def enable_validate_only():
         rows = con.execute("SELECT campaign_res FROM campaigns WHERE status='created' AND "
-                           "campaign_res IS NOT NULL").fetchall()
+                           "campaign_res IS NOT NULL LIMIT 20").fetchall()   # few ops per restart
         if not rows:
             return True, "no paused campaigns to test"
         from google.api_core import protobuf_helpers

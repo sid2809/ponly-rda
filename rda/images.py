@@ -85,63 +85,75 @@ class ReplicateClient:
         return r.content
 
 
+class StartRejected(Exception):
+    """Replicate refused this one request (4xx other than rate limit / billing): count it as
+    a failed attempt for this article only, never block the rest of the wave."""
+
+
 def start_prediction(con, client, article, model_key, extra_rule=""):
-    """Create one prediction and record its ID immediately."""
+    """Create one prediction, then record it and the article change in one transaction."""
     m = config.IMAGE_MODELS[model_key]
     copy = __import__("json").loads(article["copy_json"])
     prompt = copy["image_prompt"].strip()
     prompt += (" Photorealistic food photography. No text, letters, numbers, labels, logos,"
                " watermarks, people or hands anywhere in the image. Keep the dish centred"
                " with space around it so it also works as a square crop." + extra_rule)
-    pid = client.create(m["ref"], {"prompt": prompt, **m["input"]})
-    con.execute("INSERT INTO predictions(id,article_id,model,state,created) VALUES(?,?,?,?,?)",
-                (pid, article["id"], model_key, "starting", time.time()))
-    db.update_article(con, article["id"], status="image_pending", image_model=model_key,
-                      image_attempts=article["image_attempts"] + 1)
+    try:
+        pid = client.create(m["ref"], {"prompt": prompt, **m["input"]})
+    except Exception as e:
+        status = getattr(e, "status", None)
+        if isinstance(status, int) and 400 <= status < 500 and status not in (402, 429):
+            raise StartRejected(f"Replicate refused the request ({status}): {short(e, 200)}")
+        raise
+    with db.tx(con):
+        con.execute("INSERT INTO predictions(id,article_id,model,state,created) VALUES(?,?,?,?,?)",
+                    (pid, article["id"], model_key, "starting", time.time()))
+        db.update_article(con, article["id"], status="image_pending", image_model=model_key,
+                          image_attempts=article["image_attempts"] + 1)
     log(f"image started: {article['id']} '{short(article['title'], 60)}' model={model_key} "
         f"attempt={article['image_attempts'] + 1} prediction={pid}")
     return pid
 
 
 PREDICTION_TIMEOUT_S = 1800   # 30 min (R9): older unfinished predictions are cancelled
+DOWNLOAD_RETRY_S = 3000       # output links expire after 1 h: retry downloads until 50 min
 
 
 def _fail_prediction(con, p, reason):
-    con.execute("UPDATE predictions SET state='failed' WHERE id=?", (p["id"],))
-    a = con.execute("SELECT image_attempts, status FROM articles WHERE id=?",
-                    (p["article_id"],)).fetchone()
-    if not a or a["status"] != "image_pending":
-        return
-    if a["image_attempts"] >= 3:
-        db.update_article(con, p["article_id"], status="skipped",
-                          skip_reason=f"image could not be produced: {reason}"[:300])
-    else:
-        db.update_article(con, p["article_id"], status="copy_done",
-                          error=f"image failed, will retry: {reason}"[:300])
+    with db.tx(con):
+        con.execute("UPDATE predictions SET state='failed' WHERE id=?", (p["id"],))
+        a = con.execute("SELECT image_attempts, status FROM articles WHERE id=?",
+                        (p["article_id"],)).fetchone()
+        if not a or a["status"] != "image_pending":
+            return
+        if a["image_attempts"] >= 3:
+            db.update_article(con, p["article_id"], status="skipped",
+                              skip_reason=f"image could not be produced: {reason}"[:300])
+        else:
+            db.update_article(con, p["article_id"], status="copy_done",
+                              error=f"image failed, will retry: {reason}"[:300])
+    if a["image_attempts"] < 3:
         log(f"image failed (will retry): {p['article_id']} prediction={p['id']}: "
             f"{short(reason, 200)}")
 
 
 def poll_predictions(con, client):
-    """Collect finished predictions. Never raises for one bad prediction (P5): corrupt
-    images, missing output, lost predictions and timeouts all fail just that prediction."""
+    """Collect finished predictions. Never raises for one bad prediction (P5). A prediction
+    that already succeeded is always collected, however old (never cancelled and paid again);
+    only unfinished ones are cancelled after 30 minutes."""
     rows = con.execute("SELECT * FROM predictions WHERE state NOT IN ('done','failed')").fetchall()
     done = 0
     for p in rows:
         age = time.time() - (p["created"] or 0)
-        if age > PREDICTION_TIMEOUT_S:
-            try:
-                client.cancel(p["id"])
-                log(f"image cancelled (no result after {int(age // 60)} min): prediction={p['id']}")
-            except Exception as e:
-                log(f"image cancel failed: prediction={p['id']}: {type(e).__name__}: {short(e)}")
-            _fail_prediction(con, p, f"no result after {int(age // 60)} min")
-            continue
         try:
             status, url, err = client.get(p["id"])
-        except Exception as e:      # network / lost prediction: the timeout above handles it
-            log(f"image status could not be read (will retry): prediction={p['id']}: "
-                f"{type(e).__name__}: {short(e)}")
+        except Exception as e:
+            if age > PREDICTION_TIMEOUT_S:
+                _fail_prediction(con, p, f"status unreadable after {int(age // 60)} min: "
+                                         f"{type(e).__name__}")
+            else:
+                log(f"image status could not be read (will retry): prediction={p['id']}: "
+                    f"{type(e).__name__}: {short(e)}")
             continue
         if status == "succeeded":
             if not url:
@@ -149,17 +161,36 @@ def poll_predictions(con, client):
                 continue
             try:
                 raw = client.download(url)
+            except Exception as e:   # network: the link stays valid ~1 h, so retry later
+                if age > DOWNLOAD_RETRY_S:
+                    _fail_prediction(con, p, f"download failed: {type(e).__name__}: {short(e)}")
+                else:
+                    log(f"image download failed (will retry): prediction={p['id']}: "
+                        f"{type(e).__name__}: {short(e)}")
+                continue
+            try:
                 lp, sp = save_crops(p["article_id"], raw)
-            except Exception as e:  # corrupt / truncated / not an image
+            except Exception as e:  # corrupt / truncated / not an image / disk full
                 _fail_prediction(con, p, f"bad image: {type(e).__name__}: {e}")
                 continue
-            con.execute("UPDATE predictions SET state='done' WHERE id=?", (p["id"],))
+            with db.tx(con):
+                con.execute("UPDATE predictions SET state='done' WHERE id=?", (p["id"],))
+                a = con.execute("SELECT status FROM articles WHERE id=?",
+                                (p["article_id"],)).fetchone()
+                if a and a["status"] == "image_pending":
+                    # new image: an image asset stored for an older image must not be used
+                    db.update_article(con, p["article_id"], status="image_done", landscape_path=lp,
+                                      square_path=sp, error=None, landscape_asset=None,
+                                      square_asset=None)
             log(f"image done: {p['article_id']} model={p['model']} prediction={p['id']}")
-            # new image: any Google Ads image asset stored for an older image must not be used
-            db.update_article(con, p["article_id"], status="image_done", landscape_path=lp,
-                              square_path=sp, error=None, landscape_asset=None,
-                              square_asset=None)
             done += 1
         elif status in ("failed", "canceled"):
             _fail_prediction(con, p, f"replicate {status}: {err}")
+        elif age > PREDICTION_TIMEOUT_S:
+            try:
+                client.cancel(p["id"])
+                log(f"image cancelled (no result after {int(age // 60)} min): prediction={p['id']}")
+            except Exception as e:
+                log(f"image cancel failed: prediction={p['id']}: {type(e).__name__}: {short(e)}")
+            _fail_prediction(con, p, f"no result after {int(age // 60)} min")
     return done

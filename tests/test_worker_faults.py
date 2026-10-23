@@ -23,10 +23,12 @@ def tmp():
         config.SHEETS_MIN_WRITE_INTERVAL_S = 0
         worker.BACKOFF_S = (0, 0, 0)          # no waiting in tests
         old_gap, config.IMAGE_GAP_S = config.IMAGE_GAP_S, (0, 0)
+        old_out, config.OUTPUT_MIN_WRITE_INTERVAL_S = config.OUTPUT_MIN_WRITE_INTERVAL_S, 0
         yield d
         (config.DRY_RUN, config.DATA_DIR, config.DB_PATH, config.IMG_DIR, config.KEEP_IMAGES,
          config.SHEETS_MIN_WRITE_INTERVAL_S, worker.BACKOFF_S) = old
         config.IMAGE_GAP_S = old_gap
+        config.OUTPUT_MIN_WRITE_INTERVAL_S = old_out
 
 
 def make(every=25, claude=None, rep=None):

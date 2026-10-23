@@ -8,6 +8,7 @@ w = worker.build()
 w.sheet.set_setting("Auto-apply recommendations off", True)
 w.sheet.set_setting("Pause", False)
 config.SHEETS_MIN_WRITE_INTERVAL_S = 0
+config.OUTPUT_MIN_WRITE_INTERVAL_S = 0
 config.IMAGE_GAP_S = (0, 0)
 t0 = time.time()
 for i in range(400):

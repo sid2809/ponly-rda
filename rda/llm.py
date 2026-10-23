@@ -135,7 +135,9 @@ class Claude:
 
     def create_batch(self, requests):
         """requests: list of (custom_id, params). Returns batch id."""
-        b = self.c.messages.batches.create(
+        # no automatic retry: a retried POST after a timeout could create a second paid
+        # batch (no idempotency key); a failure is recovered by find_batch instead
+        b = self.c.with_options(max_retries=0).messages.batches.create(
             requests=[{"custom_id": cid, "params": p} for cid, p in requests])
         return b.id
 

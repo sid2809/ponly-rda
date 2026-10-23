@@ -15,6 +15,19 @@ MAX_ASSET_BYTES = 8_000_000          # one op must fit in a 9 MB add request (P8
 LOST_TRIES = 10                      # missing job / unlistable results (R12)
 RUNNING_REPORT_S = 24 * 3600
 RECONCILE_DELAY_S = 900              # let Google's search index catch up before adopting
+JOB_MAX_BYTES = 150_000_000          # one upload job holds at most ~150 MB of operations
+EXCL_TRIES = 5                       # 18-24 exclusion attempts before the campaign is held
+ENABLE_TRIES = 3
+
+
+def is_quota_error(e):
+    """RESOURCE_EXHAUSTED from any Google Ads call (search or mutate)."""
+    code = ""
+    try:
+        code = e.error.code().name
+    except Exception:
+        pass
+    return "RESOURCE_EXHAUSTED" in code + str(e) + str(getattr(e, "failure", ""))
 
 
 def make_client():
@@ -64,6 +77,7 @@ class Ads:
         self.client = client or make_client()
         self.cid = config.CUSTOMER_ID
         self.e = self.client.enums
+        self.progress = lambda: None      # the worker sets this to its lease heartbeat
 
     # ---------- helpers ----------
     def _op(self):
@@ -84,12 +98,7 @@ class Ads:
             for batch in svc.search_stream(customer_id=self.cid, query=query):
                 rows.extend(batch.results)
         except Exception as e:
-            code = ""
-            try:                                   # GoogleAdsException.error is the gRPC call
-                code = e.error.code().name
-            except Exception:
-                pass
-            if "RESOURCE_EXHAUSTED" in code + str(e) + str(getattr(e, "failure", "")):
+            if is_quota_error(e):
                 raise QuotaExhausted(str(e)[:300])
             raise
         return rows
@@ -126,7 +135,13 @@ class Ads:
                     if el.field_name == "operations":
                         idx = el.index
                         break
-                out[idx] = (out.get(idx, "") + f" {e.message}").strip()
+                code = ""
+                try:
+                    f_ = e.error_code._pb.WhichOneof("error_code")
+                    code = f"{f_}.{getattr(e.error_code, f_).name}: " if f_ else ""
+                except Exception:
+                    pass
+                out[idx] = (out.get(idx, "") + f" {code}{e.message}").strip()
         if not out:
             out[None] = pfe.message
         return out
@@ -180,18 +195,19 @@ class Ads:
                 done = json.loads(row["labels_done"] or "[]")
                 err = failed.get(i) or failed.get(None)
                 ok = not err and i < len(r.results) and r.results[i].resource_name
-                if ok or (err and ("DUPLICATE" in err.upper() or "ALREADY" in err.upper())):
+                if ok or (err and ("RESOURCE_ALREADY_EXISTS" in err or "DUPLICATE" in err)):
                     if n not in done:
                         done.append(n)
                     con.execute("UPDATE campaigns SET labels_done=? WHERE key=?",
                                 (json.dumps(done), c["key"]))
                     added += 1
-                    log(f"label '{n}' added to campaign {c['name']}")
+                    db._log_after_commit(con, f"label '{n}' added to campaign {c['name']}")
                 else:
                     con.execute("UPDATE campaigns SET label_attempts=?, error=? WHERE key=?",
                                 ((row["label_attempts"] or 0) + 1,
                                  f"label '{n}': {err}"[:500], c["key"]))
-                    log(f"label '{n}' FAILED on campaign {c['name']}: {short(err, 300)}")
+                    db._log_after_commit(con, f"label '{n}' FAILED on campaign {c['name']}: "
+                                              f"{short(err, 300)}")
         return added
 
     def label_problems(self):
@@ -317,8 +333,9 @@ class Ads:
                     cl.campaign = camp_res
                     cl.label = label_res[name]
                     ops.append(op); idx.append({"t": "label", "k": c["key"], "l": name})
-            ags = con.execute("SELECT * FROM adgroups WHERE campaign_key=? AND COALESCE(attempts,0)<3"
-                              " ORDER BY nn", (c["key"],)).fetchall()
+            ags = con.execute("SELECT * FROM adgroups WHERE campaign_key=? AND "
+                              "(COALESCE(attempts,0)<3 OR adgroup_res IS NOT NULL) ORDER BY nn",
+                              (c["key"],)).fetchall()
             for g in ags:
                 ag_res = g["adgroup_res"]
                 if not ag_res:
@@ -332,7 +349,8 @@ class Ads:
                     a.status = self.e.AdGroupStatusEnum.ENABLED
                     a.optimized_targeting_enabled = False
                     ops.append(op); idx.append({"t": "adgroup", "k": g["key"]})
-                if g["alcohol"] and not g["exclusion_res"]:
+                if g["alcohol"] and not g["exclusion_res"] and \
+                        (g["excl_attempts"] or 0) < EXCL_TRIES:
                     op = self._op()
                     cr = op.ad_group_criterion_operation.create
                     cr.ad_group = ag_res
@@ -396,9 +414,10 @@ class Ads:
                        "lang_res IS NULL)", (wave,)).fetchone():
             return True
         if con.execute("SELECT 1 FROM adgroups g JOIN campaigns c ON g.campaign_key=c.key WHERE "
-                       "c.wave=? AND c.status!='failed' AND COALESCE(g.attempts,0)<3 AND "
-                       "(g.adgroup_res IS NULL OR (g.alcohol=1 AND g.exclusion_res IS NULL))",
-                       (wave,)).fetchone():
+                       "c.wave=? AND c.status!='failed' AND ((COALESCE(g.attempts,0)<3 AND "
+                       "g.adgroup_res IS NULL) OR (g.alcohol=1 AND g.adgroup_res IS NOT NULL AND "
+                       "g.exclusion_res IS NULL AND COALESCE(g.excl_attempts,0)<?))",
+                       (wave, EXCL_TRIES)).fetchone():
             return True
         if con.execute("SELECT 1 FROM articles a JOIN adgroups g ON a.adgroup_key=g.key JOIN "
                        "campaigns c ON g.campaign_key=c.key WHERE c.wave=? AND c.status!='failed' "
@@ -473,7 +492,21 @@ class Ads:
                     n += 1
                 con.execute("UPDATE campaigns SET error=?, label_attempts=? WHERE key=?",
                             (f"label '{entry.get('l')}': {error}"[:500], n, k))
-            elif t in ("adgroup", "exclusion"):
+            elif t == "exclusion":
+                g = con.execute("SELECT * FROM adgroups WHERE key=?", (k,)).fetchone()
+                n = g["excl_attempts"] or 0
+                if ("excl", k) not in counted:
+                    counted.add(("excl", k))
+                    n += 1
+                con.execute("UPDATE adgroups SET error=?, excl_attempts=? WHERE key=?", (msg, n, k))
+                if n >= EXCL_TRIES:
+                    con.execute("UPDATE campaigns SET status='held', error=? WHERE key=? AND "
+                                "status IN ('planned','created')",
+                                (f"kept paused: 18-24 exclusion could not be added ({msg})"[:500],
+                                 g["campaign_key"]))
+                    db._log_after_commit(con, f"campaign HELD (kept paused): 18-24 exclusion "
+                                              f"failed {n} times on ad group {k}: {short(msg, 200)}")
+            elif t == "adgroup":
                 g = con.execute("SELECT * FROM adgroups WHERE key=?", (k,)).fetchone()
                 n = g["attempts"] or 0
                 if ("ag", k) not in counted:
@@ -549,8 +582,8 @@ class Ads:
             if need_b:
                 bq = ",".join(_q(f"{n} | budget") for n in need_b)
                 for x in self.search(f"SELECT campaign_budget.resource_name, campaign_budget.name "
-                                     f"FROM campaign_budget WHERE campaign_budget.name IN ({bq})",
-                                     "collision"):
+                                     f"FROM campaign_budget WHERE campaign_budget.name IN ({bq}) "
+                                     f"AND campaign_budget.status != 'REMOVED'", "collision"):
                     found_b[x.campaign_budget.name] = x.campaign_budget.resource_name
         blocked = 0
         with db.tx(con):
@@ -591,13 +624,17 @@ class Ads:
         for c in con.execute("SELECT * FROM campaigns WHERE wave=? AND status!='failed'", (wave,)):
             names += self.wanted_labels(c)
         label_res = self.ensure_labels(names)
-        chosen_ops, index, total = [], [], 0
+        chosen_ops, index, total, nbytes_job = [], [], 0, 0
         for key, ops, idx in self.iter_units(wave, logos, label_res):
+            size = sum(op._pb.ByteSize() for op in ops)
             if total + len(ops) + 20 > quota_left:
                 break
+            if chosen_ops and nbytes_job + size > JOB_MAX_BYTES:
+                break                     # memory cap: the rest goes in the next job
             chosen_ops += ops
             index += idx
             total += len(ops)
+            nbytes_job += size
         if not chosen_ops:
             return 0
         svc = self.client.get_service("BatchJobService")
@@ -622,6 +659,7 @@ class Ads:
             r = svc.add_batch_job_operations(**kw)
             token = r.next_sequence_token
             db.log_ops(con, len(part), "batch_ops")
+            self.progress()
         db.set_job(con, jid, state="run_requested")             # before run (R12)
         svc.run_batch_job(resource_name=res)
         db.log_ops(con, 1, "batch_run")
@@ -662,6 +700,18 @@ class Ads:
             if job["state"] in ("adding", "creating"):
                 # never asked to run -> nothing was created; Google deletes it after 7 days
                 db.set_job(con, job["id"], state="abandoned")
+            elif job["state"] == "run_requested" and age <= RUNNING_REPORT_S and \
+                    time.time() - db.kv_get(con, f"rerun_{job['id']}", 0) > 600:
+                # the run request may never have reached Google: ask again (a job that is
+                # no longer PENDING is refused, so this can't run anything twice)
+                db.kv_set(con, f"rerun_{job['id']}", time.time())
+                try:
+                    self.client.get_service("BatchJobService").run_batch_job(resource_name=res)
+                    db.log_ops(con, 1, "batch_run")
+                    db.set_job(con, job["id"], state="running")
+                    log(f"Google Ads job {job['id']}: run requested again")
+                except Exception as e:
+                    log(f"Google Ads job {job['id']}: run again refused: {short(e, 200)}")
             elif age > RUNNING_REPORT_S:
                 try:
                     op = self.client.get_type("BatchJobOperation")
@@ -740,7 +790,8 @@ class Ads:
         for part in _chunks(names):
             q = ",".join(_q(f"{n} | budget") for n in part)
             for x in self.search("SELECT campaign_budget.resource_name, campaign_budget.name FROM "
-                                 f"campaign_budget WHERE campaign_budget.name IN ({q})", "reconcile"):
+                                 f"campaign_budget WHERE campaign_budget.name IN ({q}) AND "
+                                 "campaign_budget.status != 'REMOVED'", "reconcile"):
                 found["budget"][x.campaign_budget.name] = x.campaign_budget.resource_name
             q = ",".join(_q(n) for n in part)
             for x in self.search("SELECT campaign.resource_name, campaign.name FROM campaign WHERE "
@@ -769,11 +820,13 @@ class Ads:
         ag_res = list(found["ag"].values())
         for part in _chunks(ag_res):
             q = ",".join(_q(r) for r in part)
-            for x in self.search("SELECT ad_group_criterion.resource_name, ad_group.resource_name FROM "
+            for x in self.search("SELECT ad_group_criterion.resource_name, ad_group.resource_name, "
+                                 "ad_group_criterion.age_range.type FROM "
                                  f"ad_group_criterion WHERE ad_group.resource_name IN ({q}) AND "
                                  "ad_group_criterion.type = 'AGE_RANGE' AND "
                                  "ad_group_criterion.negative = TRUE", "reconcile"):
-                found["excl"][x.ad_group.resource_name] = x.ad_group_criterion.resource_name
+                if x.ad_group_criterion.age_range.type_.name == "AGE_RANGE_18_24":
+                    found["excl"][x.ad_group.resource_name] = x.ad_group_criterion.resource_name
             for x in self.search("SELECT ad_group_ad.resource_name, ad_group.resource_name, "
                                  "ad_group_ad.ad.final_urls FROM ad_group_ad WHERE "
                                  f"ad_group.resource_name IN ({q}) AND ad_group_ad.status != 'REMOVED'",
@@ -885,10 +938,108 @@ class Ads:
         return logos
 
     # ---------- enable (R15: partial failure) ----------
-    def enable_wave(self, wave):
+    def pre_enable_check(self, rows):
+        """Before anything is enabled: every alcohol ad group must have its 18-24 exclusion
+        confirmed in Google Ads (not just recorded here); a campaign must have ads; its
+        budget must be 300 x its uploaded ads. Returns {key: reason} for campaigns to hold."""
         con = self.con
-        rows = con.execute("SELECT key, campaign_res FROM campaigns WHERE wave=? AND "
-                           "campaign_res IS NOT NULL AND status='created'", (wave,)).fetchall()
+        hold = {}
+        keys = [r["key"] for r in rows]
+        if not keys:
+            return hold, {}
+        q = ",".join("?" * len(keys))
+        ads_n = {r["campaign_key"]: r["n"] for r in con.execute(
+            "SELECT g.campaign_key, COUNT(a.id) n FROM adgroups g JOIN articles a ON "
+            f"a.adgroup_key=g.key WHERE g.campaign_key IN ({q}) AND a.status='uploaded' "
+            "GROUP BY g.campaign_key", keys)}
+        alc = [dict(g) for g in con.execute(
+            f"SELECT * FROM adgroups WHERE campaign_key IN ({q}) AND alcohol=1", keys)]
+        confirmed = set()
+        res = [g["adgroup_res"] for g in alc if g["adgroup_res"]]
+        for part in _chunks(res):
+            qq = ",".join(_q(r) for r in part)
+            for x in self.search("SELECT ad_group.resource_name, ad_group_criterion.age_range.type "
+                                 f"FROM ad_group_criterion WHERE ad_group.resource_name IN ({qq}) "
+                                 "AND ad_group_criterion.type = 'AGE_RANGE' AND "
+                                 "ad_group_criterion.negative = TRUE AND "
+                                 "ad_group_criterion.status != 'REMOVED'", "pre_enable"):
+                if x.ad_group_criterion.age_range.type_.name == "AGE_RANGE_18_24":
+                    confirmed.add(x.ad_group.resource_name)
+        for g in alc:
+            if g["adgroup_res"] and g["adgroup_res"] not in confirmed:
+                hold[g["campaign_key"]] = (f"18-24 exclusion not found in Google Ads on ad "
+                                           f"group {g['name']}")
+        for r in rows:
+            if not ads_n.get(r["key"]):
+                hold.setdefault(r["key"], "no ads uploaded in this campaign")
+        by_name = {}
+        names = [r["name"] for r in rows]
+        for part in _chunks(names):
+            qq = ",".join(_q(n) for n in part)
+            for x in self.search("SELECT campaign.resource_name, campaign.name FROM campaign WHERE "
+                                 f"campaign.name IN ({qq}) AND campaign.status != 'REMOVED'",
+                                 "pre_enable"):
+                by_name.setdefault(x.campaign.name, set()).add(x.campaign.resource_name)
+        for r in rows:
+            found = by_name.get(r["name"], set())
+            if len(found) > 1 or (found and r["campaign_res"] not in found):
+                hold.setdefault(r["key"], f"campaign name found {len(found)} times in the "
+                                          f"account (possible duplicate)")
+        return hold, ads_n
+
+    def resize_budgets(self, rows, ads_n):
+        """Budget = 300 x uploaded ads (planned articles may have failed). Returns
+        {key: error} for budgets that could not be changed."""
+        from google.api_core import protobuf_helpers
+        change = [r for r in rows if r["budget_res"] and ads_n.get(r["key"]) and
+                  r["n"] != ads_n[r["key"]]]
+        if not change:
+            return {}
+        ops = []
+        for r in change:
+            op = self.client.get_type("CampaignBudgetOperation")
+            op.update.resource_name = r["budget_res"]
+            op.update.amount_micros = config.BUDGET_PER_ARTICLE_INR * ads_n[r["key"]] * 1_000_000
+            self.client.copy_from(op.update_mask, protobuf_helpers.field_mask(None, op.update._pb))
+            ops.append(op)
+        resp = self.client.get_service("CampaignBudgetService").mutate_campaign_budgets(
+            request={"customer_id": self.cid, "operations": ops, "partial_failure": True})
+        db.log_ops(self.con, len(ops), "budget")
+        failed = self.partial_failures(resp)
+        errs = {}
+        for i, r in enumerate(change):
+            err = failed.get(i) or failed.get(None)
+            if err:
+                errs[r["key"]] = f"budget not resized: {err}"
+                log(f"budget resize FAILED: campaign {r['name']}: {short(err, 200)}")
+            else:
+                self.con.execute("UPDATE campaigns SET n=? WHERE key=?", (ads_n[r["key"]], r["key"]))
+                log(f"budget resized: campaign {r['name']}: {r['n']} -> {ads_n[r['key']]} ads "
+                    f"(Rs {config.BUDGET_PER_ARTICLE_INR * ads_n[r['key']]}/day)")
+        return errs
+
+    def enable_wave(self, wave):
+        """Enable the wave's paused campaigns that pass pre_enable_check. Campaigns that fail
+        the check or the enable stay paused with the reason; enable failures are retried up to
+        ENABLE_TRIES times on later loops."""
+        con = self.con
+        rows = [dict(r) for r in con.execute(
+            "SELECT * FROM campaigns WHERE wave=? AND campaign_res IS NOT NULL AND "
+            "status='created' AND COALESCE(enable_attempts,0)<?", (wave, ENABLE_TRIES))]
+        if not rows:
+            return 0
+        hold, ads_n = self.pre_enable_check(rows)
+        for r in rows:
+            if r["key"] in hold:
+                con.execute("UPDATE campaigns SET error=? WHERE key=?",
+                            (f"not enabled: {hold[r['key']]}"[:500], r["key"]))
+                log(f"enable HELD (kept paused): campaign {r['name']}: {hold[r['key']]}")
+        rows = [r for r in rows if r["key"] not in hold]
+        berr = self.resize_budgets(rows, ads_n)
+        for k, e in berr.items():
+            con.execute("UPDATE campaigns SET error=?, enable_attempts=COALESCE(enable_attempts,0)+1"
+                        " WHERE key=?", (e[:500], k))
+        rows = [r for r in rows if r["key"] not in berr]
         svc = self.client.get_service("CampaignService")
         from google.api_core import protobuf_helpers
         enabled = 0
@@ -905,22 +1056,23 @@ class Ads:
                                                  "partial_failure": True})
             db.log_ops(con, len(ops), "enable")
             failed = self.partial_failures(resp)
-            for j, r in enumerate(chunk):
-                if j in failed or None in failed:
-                    log(f"enable FAILED: campaign {r['key']}: {short(failed.get(j) or failed.get(None), 300)}")
-                else:
-                    log(f"enabled: campaign {r['key']} ({r['campaign_res'].split('/')[-1]})")
             with db.tx(con):
                 for j, r in enumerate(chunk):
-                    ok = j not in failed and j < len(resp.results) and resp.results[j].resource_name
+                    ok = (j not in failed and None not in failed and j < len(resp.results)
+                          and resp.results[j].resource_name)
                     if not ok:
-                        con.execute("UPDATE campaigns SET error=? WHERE key=?",
-                                    (f"enable failed: {failed.get(j) or failed.get(None)}"[:500],
-                                     r["key"]))
+                        err = failed.get(j) or failed.get(None) or "no result"
+                        con.execute("UPDATE campaigns SET error=?, enable_attempts="
+                                    "COALESCE(enable_attempts,0)+1 WHERE key=?",
+                                    (f"enable failed: {err}"[:500], r["key"]))
+                        db._log_after_commit(con, f"enable FAILED: campaign {r['name']}: "
+                                                  f"{short(err, 300)}")
                     else:
                         enabled += 1
-                        con.execute("UPDATE campaigns SET status='enabled', enabled_at=? WHERE key=?",
-                                    (time.time(), r["key"]))
+                        con.execute("UPDATE campaigns SET status='enabled', enabled_at=?, "
+                                    "error=NULL WHERE key=?", (time.time(), r["key"]))
+                        db._log_after_commit(con, f"enabled: campaign {r['name']} "
+                                                  f"({r['campaign_res'].split('/')[-1]})")
         return enabled
 
     # ---------- remove campaigns (pilot re-run) ----------
@@ -988,6 +1140,7 @@ class Ads:
         enh_on = 0
         updates = []
         totals = {}
+        asset_notes = {}
         for i in range(0, len(ids), 400):
             id_list = ",".join(ids[i:i + 400])
             q = ("SELECT ad_group_ad.resource_name, ad_group_ad.policy_summary.approval_status, "
@@ -1006,18 +1159,41 @@ class Ads:
                 if cs.enable_asset_enhancements or cs.enable_autogen_video:
                     enh_on += 1
                 updates.append((aid, {"approval": aga.policy_summary.approval_status.name,
+                                      "review_status": aga.policy_summary.review_status.name,
                                       "policy_note": topics or None}))
+            # image/text disapprovals are reported per asset, not on the ad
+            q3 = ("SELECT ad_group_ad_asset_view.ad_group_ad, ad_group_ad_asset_view.field_type, "
+                  "ad_group_ad_asset_view.policy_summary.approval_status FROM "
+                  f"ad_group_ad_asset_view WHERE campaign.id IN ({id_list})")
+            try:
+                for row in self.search(q3, "sync"):
+                    v = row.ad_group_ad_asset_view
+                    aid = by_ad.get(v.ad_group_ad)
+                    st = v.policy_summary.approval_status.name
+                    if aid and st in ("DISAPPROVED", "APPROVED_LIMITED", "AREA_OF_INTEREST_ONLY"):
+                        asset_notes.setdefault(aid, []).append(f"{v.field_type.name} {st}")
+                    elif aid:
+                        asset_notes.setdefault(aid, [])
+            except QuotaExhausted:
+                raise
+            except Exception as e:
+                log(f"sync: asset policy could not be read: {short(e, 200)}")
             if since_date:
-                q2 = ("SELECT ad_group_ad.resource_name, metrics.impressions, metrics.clicks "
+                q2 = ("SELECT ad_group_ad.resource_name, metrics.impressions, metrics.clicks, "
+                      "metrics.cost_micros "
                       f"FROM ad_group_ad WHERE campaign.id IN ({id_list}) "
                       f"AND segments.date BETWEEN '{since_date}' AND '{today}'")
                 for row in self.search(q2, "sync"):   # one row per ad per day: add them up
                     aid = by_ad.get(row.ad_group_ad.resource_name)
                     if aid:
-                        t = totals.setdefault(aid, [0, 0])
+                        t = totals.setdefault(aid, [0, 0, 0])
                         t[0] += row.metrics.impressions
                         t[1] += row.metrics.clicks
-        updates += [(aid, {"impressions": i, "clicks": c}) for aid, (i, c) in totals.items()]
+                        t[2] += row.metrics.cost_micros
+        updates += [(aid, {"impressions": i, "clicks": c, "cost": round(m / 1e6, 2)})
+                    for aid, (i, c, m) in totals.items()]
+        updates += [(aid, {"asset_policy": "; ".join(n) or None})
+                    for aid, n in asset_notes.items()]
         with db.tx(con):
             for aid, fields in updates:
                 db.update_article(con, aid, **fields)
@@ -1026,8 +1202,14 @@ class Ads:
         for aid, f in updates:
             if "approval" in f:
                 appr[f["approval"]] = appr.get(f["approval"], 0) + 1
-        log(f"sync: {len(ids)} campaigns; approvals {appr or 'none yet'}; "
-            f"impressions {sum(i for i, _ in totals.values())}, clicks "
-            f"{sum(c for _, c in totals.values())} since {since_date or '-'}; "
-            f"ads with enhancements/auto video ON: {enh_on}")
+        rev = {}
+        for aid, f in updates:
+            if "review_status" in f:
+                rev[f["review_status"]] = rev.get(f["review_status"], 0) + 1
+        bad_assets = sum(1 for n in asset_notes.values() if any("DISAPPROVED" in x for x in n))
+        log(f"sync: {len(ids)} campaigns; approvals {appr or 'none yet'}; review {rev or '-'}; "
+            f"ads with a disapproved image/text {bad_assets}; impressions "
+            f"{sum(t[0] for t in totals.values())}, clicks {sum(t[1] for t in totals.values())}, "
+            f"cost Rs {round(sum(t[2] for t in totals.values()) / 1e6, 2)} since "
+            f"{since_date or '-'}; ads with enhancements/auto video ON: {enh_on}")
         return enh_on

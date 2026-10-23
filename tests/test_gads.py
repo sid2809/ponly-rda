@@ -105,7 +105,7 @@ class Stub:
         elif field == "ad_group_operation":
             self.ent["ag"].append((self._ref(x.campaign), x.name, res))
         elif field == "ad_group_criterion_operation":
-            self.ent["agc"].append((self._ref(x.ad_group), res))
+            self.ent["agc"].append((self._ref(x.ad_group), res, x.age_range.type_.name))
         elif field == "asset_operation":
             self.ent["asset"].append((x.name, res))
         elif field == "ad_group_ad_operation":
@@ -115,11 +115,15 @@ class Stub:
                   status=NS(code=0, message="", details=[]))
 
     # ---- labels / campaigns (partial failure)
-    def _failure(self, idxs, msg):
+    def _failure(self, idxs, msg, code=None):
         f = self.client.get_type("GoogleAdsFailure")
         for i in idxs:
             e = self.client.get_type("GoogleAdsError")
             e.message = msg
+            if code == "exists":
+                from google.ads.googleads.v26.errors.types import mutate_error
+                e.error_code.mutate_error = mutate_error.MutateErrorEnum.MutateError.\
+                    RESOURCE_ALREADY_EXISTS
             el = type(e.location).FieldPathElement(field_name="operations", index=i)
             e.location.field_path_elements.append(el)
             f.errors.append(e)
@@ -152,7 +156,7 @@ class Stub:
             self.ent["clabel"].append((op.create.campaign, name))
             out.append(NS(resource_name=f"{op.create.campaign}~{i}"))
         return NS(results=out, partial_failure_error=self._failure(
-            bad, "DUPLICATE_CAMPAIGN_LABEL") if bad else None)
+            bad, "The resource already exists.", "exists") if bad else None)
 
     def mutate_campaign_budgets(self, request):
         out = []
@@ -184,8 +188,14 @@ class Stub:
 
     # ---- search
     def search(self, query):
+        """Answers like Google Ads, including the WHERE ... IN (...) lists the code sends
+        (rows outside the list are not returned), so missing filters show up in tests."""
         frm = re.search(r"FROM (\w+)", query).group(1)
         e = self.ent
+        inlist = set(re.findall(r"'([^']*)'", query)) if " IN (" in query else None
+
+        def keep(key):
+            return inlist is None or key in inlist
         if frm == "batch_job":
             res = query.split("'")[1]
             if self.hide_jobs or res not in self.jobs:
@@ -197,25 +207,38 @@ class Stub:
         if frm == "customer":
             return [NS(customer=NS(time_zone="Asia/Kolkata"))]
         if frm == "campaign_budget":
-            return [NS(campaign_budget=NS(name=n, resource_name=r)) for n, r in e["budget"]]
+            return [NS(campaign_budget=NS(name=n, resource_name=r)) for n, r in e["budget"]
+                    if keep(n)]
         if frm == "campaign":
-            return [NS(campaign=NS(name=n, resource_name=r)) for n, r in e["campaign"]]
+            return [NS(campaign=NS(name=n, resource_name=r)) for n, r in e["campaign"]
+                    if keep(n) or keep(r)]
         if frm == "campaign_criterion":
             return [NS(campaign=NS(resource_name=c), campaign_criterion=NS(
-                resource_name=r, type_=NS(name=t))) for c, t, r in e["crit"]]
+                resource_name=r, type_=NS(name=t))) for c, t, r in e["crit"] if keep(c)]
         if frm == "campaign_label":
-            return [NS(campaign=NS(resource_name=c), label=NS(name=n)) for c, n in e["clabel"]]
+            return [NS(campaign=NS(resource_name=c), label=NS(name=n)) for c, n in e["clabel"]
+                    if keep(c)]
         if frm == "ad_group":
             return [NS(campaign=NS(resource_name=c), ad_group=NS(name=n, resource_name=r))
-                    for c, n, r in e["ag"]]
+                    for c, n, r in e["ag"] if keep(c)]
         if frm == "ad_group_criterion":
-            return [NS(ad_group=NS(resource_name=g), ad_group_criterion=NS(resource_name=r))
-                    for g, r in e["agc"]]
+            return [NS(ad_group=NS(resource_name=g), ad_group_criterion=NS(
+                resource_name=r, age_range=NS(type_=NS(name=t)))) for g, r, t in e["agc"]
+                if keep(g)]
         if frm == "ad_group_ad":
-            return [NS(ad_group=NS(resource_name=g), ad_group_ad=NS(
-                resource_name=r, ad=NS(final_urls=[u]))) for g, u, r in e["ad"]]
+            cs = NS(enable_asset_enhancements=False, enable_autogen_video=False)
+            return [NS(ad_group=NS(resource_name=g), metrics=NS(impressions=10, clicks=1,
+                                                               cost_micros=2_000_000),
+                       ad_group_ad=NS(resource_name=r, ad=NS(
+                           final_urls=[u], responsive_display_ad=NS(control_spec=cs)),
+                           policy_summary=NS(approval_status=NS(name="APPROVED"),
+                                             review_status=NS(name="REVIEWED"),
+                                             policy_topic_entries=[])))
+                    for g, u, r in e["ad"] if keep(g) or "campaign.id IN" in query]
+        if frm == "ad_group_ad_asset_view":
+            return []
         if frm == "asset":
-            return [NS(asset=NS(name=n, resource_name=r)) for n, r in e["asset"]]
+            return [NS(asset=NS(name=n, resource_name=r)) for n, r in e["asset"] if keep(n)]
         raise AssertionError(query)
 
 
@@ -342,7 +365,8 @@ def test_create_batch_raises_changes_nothing():
         assert uploaded(con) == 4
 
 
-def test_pending_after_run_waits_then_removed_and_rebuilt_once():
+def test_run_request_lost_is_sent_again_once():
+    """run_batch_job never reached Google: the job is asked to run again (B7)."""
     with tempfile.TemporaryDirectory() as tmp:
         con, ads, stub, logos = setup(tmp)
         stub.run_crash = True
@@ -351,11 +375,25 @@ def test_pending_after_run_waits_then_removed_and_rebuilt_once():
         except RuntimeError:
             pass
         stub.run_crash = False
+        assert con.execute("SELECT state FROM jobs").fetchone()["state"] == "run_requested"
+        drive(ads, logos)
+        assert_once(stub)
+        assert uploaded(con) == 4
+
+
+def test_pending_after_run_waits_then_removed_and_rebuilt_once():
+    with tempfile.TemporaryDirectory() as tmp:
+        con, ads, stub, logos = setup(tmp)
+        stub.run_crash = True                    # every run request fails
+        try:
+            ads.run_upload(1, logos, 10000)
+        except RuntimeError:
+            pass
         job = con.execute("SELECT * FROM jobs").fetchone()
-        assert job["state"] == "run_requested"
-        drive(ads, logos, 3)                    # PENDING after run: keep waiting (R12)
+        drive(ads, logos, 3)                     # PENDING after run: keep waiting (R12)
         assert con.execute("SELECT state FROM jobs").fetchone()["state"] == "run_requested"
         assert not stub.created_counts
+        stub.run_crash = False
         con.execute("UPDATE jobs SET created=?", (time.time() - 25 * 3600,))
         drive(ads, logos, 2)
         assert stub.jobs[job["external_id"]]["status"] == "REMOVED"
@@ -487,19 +525,55 @@ def test_name_collision_blocks_campaign():
         assert final_states(con) == {"error"}
 
 
-def test_partial_enable_failure():
+def test_enable_checks_exclusion_ads_budget_and_partial_failure():
     with tempfile.TemporaryDirectory() as tmp:
         con, ads, stub, logos = setup(tmp)
         con.execute("INSERT INTO campaigns(key,wave,pool,nn,theme,name,n) "
                     "VALUES('c2',1,'P',2,'T','C2',0)")
         drive(ads, logos)
+        # c2: a campaign with no ads -> held, never enabled
         con.execute("UPDATE campaigns SET campaign_res='customers/1/campaigns/2000', "
                     "status='created' WHERE key='c2'")
-        stub.enable_fail = {"customers/1/campaigns/2000"}
+        # c1 planned 4 articles; one failed upload -> budget must drop to 3 x 300
+        con.execute("UPDATE articles SET status='error' WHERE id='a3'")
         assert ads.enable_wave(1) == 1
-        st = {r["key"]: (r["status"], r["error"]) for r in con.execute("SELECT * FROM campaigns")}
-        assert st["c1"][0] == "enabled"
-        assert st["c2"][0] == "created" and "budget too low" in st["c2"][1]
+        st = {r["key"]: dict(r) for r in con.execute("SELECT * FROM campaigns")}
+        assert st["c1"]["status"] == "enabled" and st["c1"]["n"] == 3
+        assert st["c2"]["status"] == "created" and "no ads" in st["c2"]["error"]
+
+
+def test_enable_refused_when_exclusion_missing_in_account():
+    with tempfile.TemporaryDirectory() as tmp:
+        con, ads, stub, logos = setup(tmp)
+        drive(ads, logos)
+        stub.ent["agc"].clear()                      # exclusion gone in Google Ads
+        assert ads.enable_wave(1) == 0
+        c = con.execute("SELECT * FROM campaigns").fetchone()
+        assert c["status"] == "created" and "18-24 exclusion not found" in c["error"]
+
+
+def test_exclusion_failures_never_let_alcohol_ads_go_live():
+    with tempfile.TemporaryDirectory() as tmp:
+        con, ads, stub, logos = setup(tmp, fail_types=["ad_group_criterion_operation"] * 9)
+        drive(ads, logos, rounds=12)
+        g = con.execute("SELECT * FROM adgroups").fetchone()
+        assert g["exclusion_res"] is None and g["excl_attempts"] == 5
+        assert not ads.has_work(1)
+        assert con.execute("SELECT status FROM campaigns").fetchone()[0] == "held"
+        assert ads.enable_wave(1) == 0                 # held campaigns are never enabled
+
+
+def test_enable_partial_failure_is_retried():
+    with tempfile.TemporaryDirectory() as tmp:
+        con, ads, stub, logos = setup(tmp)
+        drive(ads, logos)
+        res = con.execute("SELECT campaign_res FROM campaigns").fetchone()[0]
+        stub.enable_fail = {res}
+        assert ads.enable_wave(1) == 0
+        c = con.execute("SELECT * FROM campaigns").fetchone()
+        assert c["status"] == "created" and c["enable_attempts"] == 1
+        stub.enable_fail = set()
+        assert ads.enable_wave(1) == 1
 
 
 def test_account_today_uses_account_time_zone():
@@ -584,16 +658,24 @@ def test_sync_adds_up_daily_rows():
             if "time_zone" in q:
                 return [NS(customer=NS(time_zone="Asia/Kolkata"))]
             if "metrics" in q:          # one row per day
-                return [NS(ad_group_ad=NS(resource_name=ad), metrics=NS(impressions=100, clicks=2)),
-                        NS(ad_group_ad=NS(resource_name=ad), metrics=NS(impressions=50, clicks=1))]
+                return [NS(ad_group_ad=NS(resource_name=ad), metrics=NS(
+                            impressions=100, clicks=2, cost_micros=3_000_000)),
+                        NS(ad_group_ad=NS(resource_name=ad), metrics=NS(
+                            impressions=50, clicks=1, cost_micros=1_500_000))]
+            if "ad_group_ad_asset_view" in q:
+                return [NS(ad_group_ad_asset_view=NS(ad_group_ad=ad, field_type=NS(
+                    name="MARKETING_IMAGE"), policy_summary=NS(approval_status=NS(
+                        name="DISAPPROVED"))))]
             cs = NS(enable_asset_enhancements=False, enable_autogen_video=False)
             return [NS(ad_group_ad=NS(resource_name=ad, policy_summary=NS(
-                approval_status=NS(name="APPROVED"), policy_topic_entries=[]),
-                ad=NS(responsive_display_ad=NS(control_spec=cs))))]
+                approval_status=NS(name="APPROVED"), review_status=NS(name="REVIEWED"),
+                policy_topic_entries=[]), ad=NS(responsive_display_ad=NS(control_spec=cs))))]
         ads.search = search
         ads.sync("2026-10-24")
-        r = con.execute("SELECT impressions, clicks, approval FROM articles WHERE id='a0'").fetchone()
+        r = con.execute("SELECT * FROM articles WHERE id='a0'").fetchone()
         assert (r["impressions"], r["clicks"], r["approval"]) == (150, 3, "APPROVED")
+        assert r["cost"] == 4.5 and r["review_status"] == "REVIEWED"
+        assert r["asset_policy"] == "MARKETING_IMAGE DISAPPROVED"
 
 
 def test_model_label_added_to_existing_campaigns():

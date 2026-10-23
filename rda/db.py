@@ -55,11 +55,27 @@ def connect(path=None):
                              ("campaigns", "label_attempts", "INTEGER DEFAULT 0"),
                              ("articles", "api_errors", "INTEGER DEFAULT 0"),
                              ("articles", "big_tokens", "INTEGER DEFAULT 0"),
-                             ("articles", "note", "TEXT")):
+                             ("articles", "note", "TEXT"),
+                             ("adgroups", "excl_attempts", "INTEGER DEFAULT 0"),
+                             ("campaigns", "enable_attempts", "INTEGER DEFAULT 0"),
+                             ("articles", "review_status", "TEXT"),
+                             ("articles", "asset_policy", "TEXT"),
+                             ("articles", "cost", "REAL")):
         have = {r[1] for r in con.execute(f"PRAGMA table_info({table})")}
         if col not in have:
             con.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
     return con
+
+
+_pending_logs = {}     # log lines written inside a transaction: printed only after COMMIT
+
+
+def _log_after_commit(con, line):
+    if con.in_transaction:
+        _pending_logs.setdefault(id(con), []).append(line)
+    else:
+        from .log import log
+        log(line)
 
 
 @contextmanager
@@ -71,13 +87,18 @@ def tx(con):
         yield
     except BaseException:
         con.execute("ROLLBACK")
+        _pending_logs.pop(id(con), None)
         raise
     con.execute("COMMIT")
+    from .log import log
+    for line in _pending_logs.pop(id(con), []):
+        log(line)
 
 
 def rollback_if_open(con):
     if con.in_transaction:
         con.execute("ROLLBACK")
+    _pending_logs.pop(id(con), None)
 
 
 def kv_get(con, k, default=None):
@@ -91,11 +112,12 @@ def kv_set(con, k, v):
 
 def update_article(con, aid, **fields):
     if fields.get("status") in ("skipped", "error"):
-        from .log import log, short
+        from .log import short
         r = con.execute("SELECT title, wave FROM articles WHERE id=?", (aid,)).fetchone()
         why = fields.get("skip_reason") or fields.get("error") or ""
-        log(f"article {fields['status'].upper()}: {aid} '{short(r['title'] if r else '', 60)}' "
-            f"(wave {r['wave'] if r else '?'}): {short(why, 300)}")
+        _log_after_commit(con, f"article {fields['status'].upper()}: {aid} "
+                               f"'{short(r['title'] if r else '', 60)}' "
+                               f"(wave {r['wave'] if r else '?'}): {short(why, 300)}")
     fields["updated"] = time.time()
     cols = ", ".join(f"{k}=?" for k in fields)
     con.execute(f"UPDATE articles SET {cols} WHERE id=?", (*fields.values(), aid))

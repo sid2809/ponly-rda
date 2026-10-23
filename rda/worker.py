@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import random
+import shutil
 import signal
 import threading
 import time
@@ -18,7 +19,7 @@ import traceback
 import uuid
 
 from . import alcohol, config, db, images, lint, llm, split
-from .gads import QuotaExhausted
+from .gads import QuotaExhausted, is_quota_error
 from .log import log as _log, short
 from .sheet import OUTPUT_HEADER
 
@@ -83,6 +84,7 @@ class Worker:
     def ads(self):
         if self._ads is None:
             self._ads = self._ads_factory(self.con)
+            self._ads.progress = self.heartbeat      # keeps the lease fresh during long uploads
         return self._ads
 
     def log(self, msg):
@@ -117,10 +119,12 @@ class Worker:
         return v is True or str(v).strip().upper() == "TRUE"
 
     def paused(self):
-        """R7: unreadable Settings or a missing Pause row count as paused."""
+        """R7: unreadable Settings or a missing Pause row count as paused. Fails closed: only
+        an unticked box (FALSE) means running; anything else ('yes', '1', text) is paused."""
         if self.settings is None or "Pause" not in self.settings:
             return True
-        return self.s_bool("Pause")
+        v = self.settings.get("Pause")
+        return not (v is False or str(v).strip().upper() == "FALSE")
 
     def num(self, key, default):
         """P16: accepts '14,000'; a bad value falls back to the default and is reported."""
@@ -207,6 +211,10 @@ class Worker:
             self.log(f"{key}: Google Ads quota exhausted, waiting 1 h ({e})")
         except Exception as e:
             db.rollback_if_open(self.con)
+            if is_quota_error(e):                     # a mutate call hit the daily limit
+                db.kv_set(self.con, "quota_wait_until", time.time() + 3600)
+                self.log(f"{key}: Google Ads quota exhausted, waiting 1 h ({short(e, 200)})")
+                return
             n = e0.get("count", 0) + 1
             until = time.time() + BACKOFF_S[min(n - 3, 2)] if (backoff and n >= 3) else 0
             errs = db.kv_get(self.con, "step_errors", {})
@@ -234,7 +242,8 @@ class Worker:
         try:
             bid = self.claude.create_batch(reqs)
         except Exception:
-            db.set_job(self.con, jid, state="abandoned")
+            # the batch may exist anyway (e.g. timeout after Anthropic accepted it): leave the
+            # row 'creating' so recovery looks for it before anything is sent again
             raise
         self.log(f"{kind} batch {bid} created ({len(reqs)} requests, wave {wave})")
         with db.tx(self.con):
@@ -324,6 +333,18 @@ class Worker:
                         fields["copy_attempts"] = max(0, (r["copy_attempts"] or 0) - 1)
                     db.update_article(con, r["id"], **fields)
             self.log(f"recovery: {len(orphans)} {pend} articles had no open job; reverted to {back}")
+        # an image whose prediction row is finished/missing must not wait forever
+        stuck = [r["id"] for r in con.execute(
+            "SELECT a.id FROM articles a WHERE a.status='image_pending' AND NOT EXISTS ("
+            "SELECT 1 FROM predictions p WHERE p.article_id=a.id AND p.state NOT IN "
+            "('done','failed'))")]
+        if stuck:
+            with db.tx(con):
+                for aid in stuck:
+                    db.update_article(con, aid, status="copy_done",
+                                      error="image interrupted; will be made again")
+            self.log(f"recovery: {len(stuck)} image_pending articles had no open prediction; "
+                     f"back to copy_done")
 
     def _adopt_or_abandon(self, kind, j):
         """A 'creating' row with no batch ID: the process died during create_batch.
@@ -337,6 +358,9 @@ class Worker:
             except Exception as e:
                 self.log(f"find_batch failed: {e}")
                 return                                   # try again next tick
+            owned = {r[0] for r in self.con.execute(
+                "SELECT external_id FROM jobs WHERE external_id IS NOT NULL")}
+            found = [b for b in found if b not in owned]   # never take another job's batch
         if len(found) == 1:
             with db.tx(self.con):
                 db.set_job(self.con, j["id"], external_id=found[0], state="running")
@@ -365,7 +389,7 @@ class Worker:
         n = (a["api_errors"] or 0) + 1
         if kind == "alcohol":
             if n >= ALCOHOL_API_FALLBACK:
-                db.update_article(con, aid, alcohol=1, status="tagged", api_errors=n,
+                db.update_article(con, aid, alcohol=1, status="tagged", api_errors=0,
                                   alcohol_reason=f"check failed ({msg}); treated as alcohol"[:300])
             else:
                 db.update_article(con, aid, status="url_ok", api_errors=n)
@@ -433,13 +457,13 @@ class Worker:
                 continue
             if kind == "ok":
                 db.update_article(con, a["id"], alcohol=int(bool(data["alcohol"])), status="tagged",
-                                  alcohol_reason=f"Haiku: {data['reason']}"[:300])
+                                  alcohol_reason=f"Haiku: {data['reason']}"[:300], api_errors=0)
             elif kind == "refusal":
-                db.update_article(con, a["id"], alcohol=1, status="tagged",
+                db.update_article(con, a["id"], alcohol=1, status="tagged", api_errors=0,
                                   alcohol_reason="check failed (Haiku refused); treated as alcohol")
             elif kind == "max_tokens":
                 if not self._cut_off("alcohol", a):
-                    db.update_article(con, a["id"], alcohol=1, status="tagged",
+                    db.update_article(con, a["id"], alcohol=1, status="tagged", api_errors=0,
                                       alcohol_reason="check failed (answer cut off twice); "
                                                      "treated as alcohol")
             else:
@@ -685,8 +709,8 @@ class Worker:
         room = MAX_INFLIGHT_IMAGES - inflight
         if room <= 0:
             return
-        todo = con.execute("SELECT * FROM articles WHERE wave=? AND status='copy_done' LIMIT ?",
-                           (w, room)).fetchall()
+        todo = con.execute("SELECT * FROM articles WHERE wave=? AND status='copy_done' "
+                           "ORDER BY updated LIMIT ?", (w, room)).fetchall()
         counts = {"reused": 0, "started": 0}
         try:
             self._image_loop(w, todo, counts)
@@ -727,11 +751,25 @@ class Worker:
                 if self.stop.wait(wait):
                     return
                 self.heartbeat()
+            free = shutil.disk_usage(config.DATA_DIR).free
+            if free < config.MIN_FREE_DISK_BYTES:      # never pay for an image we can't save
+                raise RuntimeError(f"disk nearly full ({free // 2**20} MB free on "
+                                   f"{config.DATA_DIR}); no new images started")
             extra = (" Absolutely no writing or symbols of any kind on any surface."
                      if a["check_failed_once"] else "")
             regen = a["image_attempts"] >= 1
             try:
                 images.start_prediction(con, self.rep, a, model, extra)
+            except images.StartRejected as e:      # this article only; the rest carry on
+                n = (a["image_attempts"] or 0) + 1
+                if n >= 3:
+                    db.update_article(con, a["id"], status="skipped", image_attempts=n,
+                                      skip_reason=f"image request refused 3 times: {e}"[:300])
+                else:
+                    db.update_article(con, a["id"], image_attempts=n,
+                                      error=f"image request refused, will retry: {e}"[:300])
+                    self.log(f"image request refused (attempt {n}/3): {a['id']}: {short(e, 200)}")
+                continue
             finally:
                 db.kv_set(con, "last_image_request", time.time())
             counts["started"] += 1
@@ -874,15 +912,26 @@ class Worker:
 
     # ---------------------------------------------------------------- enable
     def step_enable(self, w):
+        """First tick after 'W enable': enable everything that passes the pre-enable check.
+        Afterwards, every 30 min, retry campaigns still paused (held or failed), so one
+        failure never leaves a campaign off without anyone noticing."""
         con = self.con
-        if db.kv_get(con, f"enabled_{w}") or not db.kv_get(con, f"uploaded_{w}"):
+        if not db.kv_get(con, f"uploaded_{w}") or not self.s_bool(f"W{w} enable"):
             return
-        if self.s_bool(f"W{w} enable"):
-            n = self.ads.enable_wave(w)
-            db.kv_set(con, f"enabled_{w}", True)      # every campaign was attempted (P10)
+        first = not db.kv_get(con, f"enabled_{w}")
+        if not first and time.time() - db.kv_get(con, f"enable_try_{w}", 0) < 1800:
+            return
+        db.kv_set(con, f"enable_try_{w}", time.time())
+        n = self.ads.enable_wave(w)
+        if first:
+            db.kv_set(con, f"enabled_{w}", True)
             db.kv_set(con, f"enabled_date_{w}", self.ads.account_today())
             db.kv_set(con, "sync_now", True)
-            self.log(f"wave {w}: enabled {n} campaigns")
+        left = con.execute("SELECT COUNT(*) FROM campaigns WHERE wave=? AND status IN "
+                           "('created','held')", (w,)).fetchone()[0]
+        if first or n:
+            self.log(f"wave {w}: enabled {n} campaigns; {left} still paused (see Campaign map > "
+                     f"Error)")
 
     # ------------------------------------------------------------------ sync
     def step_sync(self):
@@ -909,6 +958,22 @@ class Worker:
 
     # --------------------------------------------------------------- reports
     def write_reports(self, force=False):
+        """Summary first (the health signal), then Campaign map, then Output. Each tab on its
+        own, so one failing write never blocks the others. Output (8,000+ rows) is written
+        only when something in it changed, and at most every 15 minutes."""
+        errors = []
+        for tab, fn in (("Summary", lambda: self.sheet.write("Summary", self.summary_rows(),
+                                                              force)),
+                        ("Campaign map", lambda: self._write_campaign_map(force)),
+                        ("Output", lambda: self._write_output(force))):
+            try:
+                fn()
+            except Exception as e:
+                errors.append(f"{tab}: {type(e).__name__}: {short(e, 200)}")
+                self.log(f"report error ({tab}): {type(e).__name__}: {short(e, 300)}")
+        db.kv_set(self.con, "report_errors", errors)
+
+    def _write_output(self, force=False):
         con = self.con
         camp = {r["key"]: dict(r) for r in con.execute("SELECT * FROM campaigns")}
         ag = {r["key"]: dict(r) for r in con.execute("SELECT * FROM adgroups")}
@@ -924,8 +989,21 @@ class Worker:
                         a["policy_note"] or "",
                         (c.get("campaign_res") or "").split("/")[-1], a["ad_id"] or "",
                         a["impressions"] or 0, a["clicks"] or 0, round(a["regen_cost"] or 0, 3),
-                        a["note"] or ""])
-        self.sheet.write("Output", out, force)
+                        a["note"] or "", a["review_status"] or "", a["asset_policy"] or "",
+                        a["cost"] or 0])
+        digest = hashlib.sha1(json.dumps(out, default=str).encode()).hexdigest()
+        last = db.kv_get(con, "output_written", {})
+        if not force and (last.get("digest") == digest or
+                          time.time() - last.get("t", 0) < config.OUTPUT_MIN_WRITE_INTERVAL_S):
+            return
+        db.kv_set(con, "output_written", {"digest": last.get("digest"), "t": time.time()})
+        self.sheet.write("Output", out, True)
+        db.kv_set(con, "output_written", {"digest": digest, "t": time.time()})
+
+    def _write_campaign_map(self, force=False):
+        con = self.con
+        camp = {r["key"]: dict(r) for r in con.execute("SELECT * FROM campaigns")}
+        ag = {r["key"]: dict(r) for r in con.execute("SELECT * FROM adgroups")}
         cm = [["Campaign ID", "Campaign name", "Ad group ID", "Ad group name", "Wave",
                "Image model", "Campaign status", "Error"]]
         for g in ag.values():
@@ -937,7 +1015,25 @@ class Worker:
                        c["image_model"] or "", c["status"],
                        c.get("error") or g.get("error") or ""])
         self.sheet.write("Campaign map", cm, force)
-        self.sheet.write("Summary", self.summary_rows(), force)
+
+    def _disk_free_mb(self):
+        try:
+            return shutil.disk_usage(config.DATA_DIR).free // 2**20
+        except OSError:
+            return "unknown"
+
+    def _image_eta(self, w):
+        con = self.con
+        waiting = con.execute("SELECT COUNT(*) FROM articles WHERE wave=? AND status IN "
+                              "('themed','copy_pending','copy_done','image_pending')",
+                              (w,)).fetchone()[0]
+        if not waiting:
+            return "-"
+        hour = con.execute("SELECT COUNT(*) FROM predictions WHERE created>?",
+                           (time.time() - 3600,)).fetchone()[0]
+        if not hour:
+            return f"{waiting} articles still need images (none started in the last hour)"
+        return f"{waiting} waiting; ~{hour}/hour now -> ~{waiting / hour:.1f} h (estimate)"
 
     def summary_rows(self):
         con = self.con
@@ -947,9 +1043,12 @@ class Worker:
         counts = {r["status"]: r["n"] for r in con.execute(
             "SELECT status, COUNT(*) n FROM articles GROUP BY status")}
         preds = {r["model"]: r["n"] for r in con.execute(
-            "SELECT model, COUNT(*) n FROM predictions GROUP BY model")}
+            "SELECT model, COUNT(*) n FROM predictions WHERE state='done' GROUP BY model")}
+        started = con.execute("SELECT COUNT(*) FROM predictions").fetchone()[0]
+        extra_imgs = len(db.kv_get(con, "preflight_images", {})) + (
+            1 if db.kv_get(con, "pilot_rerun", {}).get("cancel_test") else 0)
         img_usd = sum(config.IMAGE_MODELS.get(m, {}).get("est_usd", 0) * n
-                      for m, n in preds.items())
+                      for m, n in preds.items()) + 0.039 * extra_imgs
         rows = [["Item", "Value"],
                 ["Updated", time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())],
                 ["Mode", "DRY RUN (nothing real)" if config.DRY_RUN else "live"],
@@ -996,8 +1095,28 @@ class Worker:
                   count("SELECT COUNT(*) FROM articles WHERE skip_reason LIKE 'API errors%' OR "
                         "skip_reason LIKE 'image check could not run%'")],
                  ["Batch API error results (total, retried)", db.kv_get(con, "batch_errors_total", 0)],
-                 ["Images made (by model)", json.dumps(preds)],
-                 ["Replicate spend (estimate, confirm in billing)", round(img_usd, 2)],
+                 ["Images made (finished, by model)", json.dumps(preds)],
+                 ["Image requests started (incl. failed/cancelled)", started],
+                 ["Replicate spend (estimate incl. preflight + cancel test; confirm in billing)",
+                  round(img_usd, 2)],
+                 ["Disk free on the volume (MB)", self._disk_free_mb()],
+                 ["Campaigns HELD paused (see Campaign map > Error)",
+                  count("SELECT COUNT(*) FROM campaigns WHERE status='held' OR (status='created' "
+                        "AND error LIKE 'not enabled%')")],
+                 ["Ad review status (count)", json.dumps({r[0] or "-": r[1] for r in con.execute(
+                     "SELECT review_status, COUNT(*) FROM articles WHERE status='uploaded' "
+                     "GROUP BY review_status")})],
+                 ["Ads still not reviewed 48 h after their campaign was enabled",
+                  count("SELECT COUNT(*) FROM articles a JOIN adgroups g ON a.adgroup_key=g.key "
+                        "JOIN campaigns c ON g.campaign_key=c.key WHERE a.status='uploaded' AND "
+                        "c.status='enabled' AND c.enabled_at<? AND (a.approval IS NULL OR "
+                        "a.approval IN ('UNKNOWN','UNSPECIFIED'))", time.time() - 172800)],
+                 ["Ads with a disapproved image/text",
+                  count("SELECT COUNT(*) FROM articles WHERE asset_policy LIKE '%DISAPPROVED%'")],
+                 ["Ad spend so far (Rs, from the last sync)",
+                  json.dumps({f"wave {r[0]}": round(r[1] or 0, 2) for r in con.execute(
+                      "SELECT wave, SUM(cost) FROM articles WHERE status='uploaded' GROUP BY wave")})],
+                 ["Report write problems", "; ".join(db.kv_get(con, "report_errors", [])) or "none"],
                  ["Google Ads API operations, last 24 h", db.ops_last_24h(con)],
                  ["Google Ads quota wait until",
                   time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(db.kv_get(con, "quota_wait_until")))
@@ -1010,6 +1129,7 @@ class Worker:
         for w in (1, 2, 3):
             st = self.wave_stats(w)
             rows.append([f"Wave {w} status", self.wave_status(w)])
+            rows.append([f"Wave {w} images ETA", self._image_eta(w)])
             rows.append([f"Wave {w}", json.dumps({**st,
                          "planned": bool(db.kv_get(con, f"planned_{w}")),
                          "uploaded_all": bool(db.kv_get(con, f"uploaded_{w}")),
@@ -1090,9 +1210,10 @@ class Worker:
                         continue
                     self.run_step(f"{name}:w{w}", fn, w)
             if ads_ok:
-                self.run_step("labels", self.ads.add_missing_labels)
-            self.run_step("sync", self.step_sync)
+                self.run_step("labels", lambda: self.ads.add_missing_labels())
         finally:
+            # read-only: keeps approvals, clicks and cost current even while paused
+            self.run_step("sync", self.step_sync)
             try:
                 db.rollback_if_open(self.con)
                 db.kv_set(self.con, "settings_problems", sorted(set(self.settings_problems)))
@@ -1199,7 +1320,10 @@ def main():
     w.stop = stop
     w.log("Worker started. Sheet tabs ready.")
     db.kv_set(w.con, "connections", check_connections(w))
-    if not config.DRY_RUN:
+    while not w.acquire_lease() and not stop.is_set():      # live check writes state too
+        w.log("another worker holds the database lease; waiting before the live check")
+        stop.wait(60)
+    if not config.DRY_RUN and not stop.is_set():
         try:
             from . import livecheck
             livecheck.run(w)              # read-only checks against the real accounts
@@ -1215,10 +1339,9 @@ def main():
         if paused != was_paused:
             w.log("PAUSED (untick Pause in Settings to run)" if paused else "RUNNING")
             was_paused = paused
-        if db.kv_get(w.con, "enabled_3") and db.kv_get(w.con, "final_sync_done"):
-            w.log("All waves enabled and synced. Work finished; stop the Railway service.")
-            stop.wait(3600)
-            continue
+        if db.kv_get(w.con, "enabled_3") and not db.kv_get(w.con, "finished_logged"):
+            db.kv_set(w.con, "finished_logged", True)
+            w.log("All waves enabled. The worker keeps syncing approvals, clicks and cost.")
         stop.wait(config.LOOP_SLEEP_S)
     w.release_lease()
     w.log("stopped cleanly")
