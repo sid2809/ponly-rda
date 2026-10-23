@@ -38,3 +38,17 @@ Wave 3 starts after Wave 2 passes.
 ## Settings tab
 W1/W2/W3 enable · Image model (nano-banana / minimax) · Daily API quota cap · Access level ·
 Auto-apply recommendations off · Pilot categories · Pause
+
+## Safety (code-review fixes)
+- Each step runs on its own: one failing step is shown in Summary ("Last errors") and, after
+  3 failures in a row, waits 10 → 30 → 60 min. The Sheet reports are written every minute.
+- Every paid job (Claude batch, Google Ads batch) is saved with its article IDs before the
+  paid call. On restart, articles no open job covers go back one step; nothing is paid twice.
+- API errors never count as a failed copy/check, but are capped (5; image check: 2;
+  alcohol: treated as alcohol after 3).
+- Google Ads jobs that can't be found are "lost": the account is searched and anything that
+  already exists is adopted, so nothing is created twice. Name collisions block a campaign.
+- Labels that can't be used are reported and skipped; they never block an upload.
+- Settings that can't be read, or a missing Pause row, mean paused.
+- Only one worker can use the database at a time (lease; a stale lease frees after 15 min).
+- The worker refuses to start unless `DATA_DIR` is a mounted volume.

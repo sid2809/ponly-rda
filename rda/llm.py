@@ -2,7 +2,6 @@
 Haiku 5.5 rules respected: no temperature, no prefill; JSON via output_config.format."""
 import base64
 import json
-import math
 
 from . import config
 
@@ -47,7 +46,7 @@ def _params(content, schema, max_tokens):
             "output_config": {"format": {"type": "json_schema", "schema": schema}}}
 
 
-def copy_params(title, category, theme, problems=None):
+def copy_params(title, category, theme, problems=None, big=False):
     fix = ""
     if problems:
         fix = ("\nYour previous attempt failed these checks; fix them:\n- "
@@ -66,10 +65,10 @@ Rules:
 - No ALL-CAPS words, no exclamation marks in headlines, no repeated punctuation.
 - image_prompt: one sentence describing a photorealistic photo of this exact dish,
   plated, natural light. No text, no logos, no people, no hands. Dish centred.{fix}"""
-    return _params(text, COPY_SCHEMA, 4000)
+    return _params(text, COPY_SCHEMA, 16000 if big else 8000)
 
 
-def check_params(title, landscape_bytes, square_bytes):
+def check_params(title, landscape_bytes, square_bytes, big=False):
     def img(b):
         return {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg",
                                             "data": base64.b64encode(b).decode()}}
@@ -79,30 +78,60 @@ a watermark; a logo or brand; a real person, face, body part or hands; adult, vi
 disturbing content; a collage or split image; heavy blur or distortion; or a dish that does
 not match the title. Otherwise pass. List each problem briefly."""
     return _params([img(landscape_bytes), img(square_bytes), {"type": "text", "text": text}],
-                   CHECK_SCHEMA, 2000)
+                   CHECK_SCHEMA, 8000 if big else 4000)
 
 
-def alcohol_params(title):
+def alcohol_params(title, big=False):
     text = f"""Recipe title: "{title}"
 Answer alcohol=true if the title names an alcoholic drink (including cocktail names such as
 Mai Tai or Cosmopolitan), names an alcoholic ingredient, or is a drink whose alcohol content
 is unclear (punch, cider, eggnog, toddy). Words used only as style descriptions (e.g.
 "Old Fashioned" meaning traditional) do not count. Dishes count only if alcohol is named in
 the title. If genuinely ambiguous, answer true."""
-    return _params(text, ALCOHOL_SCHEMA, 1000)
+    return _params(text, ALCOHOL_SCHEMA, 8000 if big else 4000)
+
+
+class LLMError(Exception):
+    """kind: 'api' (transport, rate limit, overload, bad JSON, expired/errored batch entry),
+    'refusal' (model refused: a content verdict), 'max_tokens' (answer cut off)."""
+
+    def __init__(self, kind, msg):
+        super().__init__(f"{kind}: {msg}")
+        self.kind = kind
+        self.msg = str(msg)[:300]
+
+
+def _parse_message(msg):
+    """Message -> parsed JSON, or raise LLMError by stop_reason (R1/P4)."""
+    if msg.stop_reason == "refusal":
+        raise LLMError("refusal", "model refused")
+    if msg.stop_reason == "max_tokens":
+        raise LLMError("max_tokens", "answer cut off at max_tokens")
+    if msg.stop_reason != "end_turn":
+        raise LLMError("api", f"stop_reason={msg.stop_reason}")
+    try:
+        text = next(b.text for b in msg.content if b.type == "text")
+        return json.loads(text)
+    except Exception as e:
+        raise LLMError("api", f"bad JSON: {e}")
 
 
 class Claude:
     def __init__(self):
         import anthropic
-        self.c = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
+        # SDK retries 408/409/429/5xx (incl. 529 overloaded) with backoff
+        self.c = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY, max_retries=6)
 
     def sync_json(self, params):
-        # streaming: the SDK refuses large max_tokens on non-streaming calls
-        with self.c.messages.stream(**params) as stream:
-            r = stream.get_final_message()
-        text = next(b.text for b in r.content if b.type == "text")
-        return json.loads(text)
+        """Raises LLMError. Streaming: the SDK refuses large max_tokens without it."""
+        try:
+            with self.c.messages.stream(**params) as stream:
+                r = stream.get_final_message()
+        except LLMError:
+            raise
+        except Exception as e:
+            raise LLMError("api", f"{type(e).__name__}: {e}")
+        return _parse_message(r)
 
     def create_batch(self, requests):
         """requests: list of (custom_id, params). Returns batch id."""
@@ -113,42 +142,58 @@ class Claude:
     def batch_ended(self, batch_id):
         return self.c.messages.batches.retrieve(batch_id).processing_status == "ended"
 
+    def find_batch(self, created_after, created_before, n_requests):
+        """Batches created in the window with exactly n requests (R5/R19/R21)."""
+        out = []
+        for b in self.c.messages.batches.list(limit=50):
+            ts = b.created_at.timestamp()
+            if ts < created_after - 3600:     # newest first: nothing older can match
+                break
+            rc = b.request_counts
+            total = rc.processing + rc.succeeded + rc.errored + rc.canceled + rc.expired
+            if created_after <= ts <= created_before and total == n_requests:
+                out.append(b.id)
+        return out
+
     def batch_results(self, batch_id):
+        """{custom_id: ("ok", data) | (kind, message)} with kind api/refusal/max_tokens."""
         out = {}
         for e in self.c.messages.batches.results(batch_id):
             if e.result.type == "succeeded":
                 try:
-                    text = next(b.text for b in e.result.message.content if b.type == "text")
-                    out[e.custom_id] = (True, json.loads(text))
-                except Exception as ex:
-                    out[e.custom_id] = (False, f"bad JSON: {ex}")
-            else:
-                out[e.custom_id] = (False, e.result.type)
+                    out[e.custom_id] = ("ok", _parse_message(e.result.message))
+                except LLMError as le:
+                    out[e.custom_id] = (le.kind, le.msg)
+            else:   # errored / expired / canceled
+                out[e.custom_id] = ("api", f"batch entry {e.result.type}")
         return out
 
 
-def build_themes(claude, category, titles, cache=None):
-    """Two steps: fixed theme list from all titles, then each title gets a theme.
-    Chunks stay well under the 100k-token long-prompt price tier."""
+def build_themes(claude, category, titles, state, save):
+    """Theme list, then each title gets a theme. `state` holds progress for this pool
+    ({"themes": [...], "assigned": {index: theme}}) and `save()` persists it after every
+    paid call, so a failure never re-pays finished work (P6). Returns
+    (themes, assigned_list, defaulted_indexes)."""
     n = len(titles)
-    target = max(1, round(n / 10))
-    listing = "\n".join(titles)
-    cached = cache.get(category) if cache is not None else None
-    themes = cached or claude.sync_json(_params(
-        f"""Here are {n} recipe titles from the category "{category}".
+    if not state.get("themes"):
+        target = max(1, round(n / 10))
+        listing = "\n".join(titles)
+        res = claude.sync_json(_params(
+            f"""Here are {n} recipe titles from the category "{category}".
 Create about {target} themes that group similar recipes (by main ingredient, dish type or
 flavour). Each theme name: 2-4 words, at most 28 characters, Title Case, no numbers,
 no punctuation except '&'. Themes must not overlap.
 
-{listing}""", THEMES_SCHEMA, 8000))["themes"]
-    themes = [t.strip()[:28] for t in themes if t.strip()] or ["Recipes"]
-    if cache is not None:
-        cache[category] = themes
-    assigned = {}
+{listing}""", THEMES_SCHEMA, 16000))
+        state["themes"] = [t.strip()[:28] for t in res["themes"] if t.strip()] or ["Recipes"]
+        save()
+    themes = state["themes"]
+    assigned = state.setdefault("assigned", {})
     numbered_themes = "\n".join(f"{k}. {t}" for k, t in enumerate(themes))
 
-    def assign(start, part, depth=0):
-        lines = "\n".join(f"{i}. {t}" for i, t in enumerate(part))
+    def ask(indexes, depth=0):
+        part = [titles[i] for i in indexes]
+        lines = "\n".join(f"{j}. {t}" for j, t in enumerate(part))
         try:
             res = claude.sync_json(_params(
                 f"""Themes:
@@ -158,19 +203,25 @@ Assign each numbered recipe title below to exactly one theme. Answer with pairs
 [title number, theme number] for every title, e.g. {{"a": [[0, 3], [1, 0]]}}.
 
 {lines}""", ASSIGN_SCHEMA, 8000))
-            pairs = res["a"]
-        except Exception:
-            if depth >= 3 or len(part) <= 10:
+        except LLMError:
+            if depth >= 3 or len(indexes) <= 10:
                 raise
-            half = len(part) // 2            # answer cut off or invalid: retry in halves
-            assign(start, part[:half], depth + 1)
-            assign(start + half, part[half:], depth + 1)
+            half = len(indexes) // 2         # answer cut off or invalid: retry in halves
+            ask(indexes[:half], depth + 1)
+            ask(indexes[half:], depth + 1)
             return
-        for pr in pairs:
+        for pr in res.get("a", []):
             if len(pr) == 2 and 0 <= pr[0] < len(part) and 0 <= pr[1] < len(themes):
-                assigned[start + pr[0]] = themes[pr[1]]
+                assigned[str(indexes[pr[0]])] = themes[pr[1]]
+        save()
 
     per = 150   # titles per call keeps each answer short
     for start in range(0, n, per):
-        assign(start, titles[start:start + per])
-    return themes, [assigned.get(i, themes[0]) for i in range(n)]
+        todo = [i for i in range(start, min(n, start + per)) if str(i) not in assigned]
+        if todo:
+            ask(todo)
+    missing = [i for i in range(n) if str(i) not in assigned]
+    if missing:          # titles left out of an answer: ask once more for just those
+        ask(missing)
+    defaulted = [i for i in range(n) if str(i) not in assigned]
+    return themes, [assigned.get(str(i), themes[0]) for i in range(n)], defaulted

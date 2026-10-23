@@ -3,6 +3,7 @@ import json
 import os
 import sqlite3
 import time
+from contextlib import contextmanager
 
 from . import config
 
@@ -51,11 +52,32 @@ def connect(path=None):
                              ("adgroups", "error", "TEXT"), ("adgroups", "attempts", "INTEGER DEFAULT 0"),
                              ("articles", "check_api_errors", "INTEGER DEFAULT 0"),
                              ("campaigns", "labels_done", "TEXT"),
-                             ("campaigns", "label_attempts", "INTEGER DEFAULT 0")):
+                             ("campaigns", "label_attempts", "INTEGER DEFAULT 0"),
+                             ("articles", "api_errors", "INTEGER DEFAULT 0"),
+                             ("articles", "big_tokens", "INTEGER DEFAULT 0"),
+                             ("articles", "note", "TEXT")):
         have = {r[1] for r in con.execute(f"PRAGMA table_info({table})")}
         if col not in have:
             con.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
     return con
+
+
+@contextmanager
+def tx(con):
+    """BEGIN IMMEDIATE ... COMMIT; ROLLBACK on any exception (R6).
+    Never make network calls inside this block."""
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        yield
+    except BaseException:
+        con.execute("ROLLBACK")
+        raise
+    con.execute("COMMIT")
+
+
+def rollback_if_open(con):
+    if con.in_transaction:
+        con.execute("ROLLBACK")
 
 
 def kv_get(con, k, default=None):
@@ -101,5 +123,5 @@ def set_job(con, jid, **fields):
 
 
 def open_jobs(con, kind):
-    return con.execute("SELECT * FROM jobs WHERE kind=? AND state NOT IN ('done','abandoned')"
+    return con.execute("SELECT * FROM jobs WHERE kind=? AND state NOT IN ('done','abandoned','lost')"
                        " ORDER BY id", (kind,)).fetchall()

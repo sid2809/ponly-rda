@@ -6,3 +6,4 @@ replicate==1.0.7
 pillow>=10
 requests>=2.31
 pytest>=8
+tzdata

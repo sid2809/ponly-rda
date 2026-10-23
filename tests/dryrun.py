@@ -1,18 +1,17 @@
 """Full offline dry run: python -m tests.dryrun  (uses fakes, nothing real)."""
-import os, sys, tempfile, time
+import os, tempfile, time
 os.environ["DRY_RUN"] = "1"
 os.environ.setdefault("DATA_DIR", tempfile.mkdtemp(prefix="rda_dry_"))
-from rda import config, db, worker, fakes
+from rda import config, db, worker
 
 w = worker.build()
 w.sheet.set_setting("Auto-apply recommendations off", True)
+w.sheet.set_setting("Pause", False)
 config.SHEETS_MIN_WRITE_INTERVAL_S = 0
 t0 = time.time()
 for i in range(400):
     w.tick()
     con = w.con
-    if i == 5:
-        pass
     # simulate Siddharth: enable boxes once uploads finish; choose model after pilot
     for n in (1, 2, 3):
         if db.kv_get(con, f"uploaded_{n}"):

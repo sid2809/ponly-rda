@@ -29,7 +29,7 @@ SETTINGS_DEFAULTS = [
 OUTPUT_HEADER = ["ID", "Category", "Title", "Final URL", "Alcohol", "Alcohol reason", "Wave",
                  "Image model", "Campaign", "Ad group", "Status", "Error / skip reason",
                  "Approval", "Policy note", "Campaign ID", "Ad ID", "Impressions", "Clicks",
-                 "Regeneration cost ($)"]
+                 "Regeneration cost ($)", "Note"]
 
 
 class Sheet:
@@ -44,12 +44,17 @@ class Sheet:
         self._last_write = {}
 
     def _call(self, req):
+        """Retry 429 / 5xx (incl. 504), timeouts and transport errors (P14)."""
+        import socket
         for attempt in range(6):
             try:
                 return req.execute()
-            except Exception as e:  # 429 / 5xx: back off
+            except Exception as e:
                 code = getattr(getattr(e, "resp", None), "status", None)
-                if code in (429, 500, 502, 503) and attempt < 5:
+                transient = (code in (429, 500, 502, 503, 504) or
+                             isinstance(e, (socket.timeout, TimeoutError, ConnectionError,
+                                            OSError)) and code is None)
+                if transient and attempt < 5:
                     time.sleep(2 ** attempt * 5)
                     continue
                 raise
@@ -96,15 +101,16 @@ class Sheet:
         return out
 
     def write(self, tab, rows, force=False):
-        """Overwrite a whole tab. Throttled to one write per tab per minute."""
+        """Overwrite a tab: write the new values first, then clear only what is left below
+        (P14), so a failure never leaves the tab empty. Throttled per tab."""
         now = time.time()
         if not force and now - self._last_write.get(tab, 0) < config.SHEETS_MIN_WRITE_INTERVAL_S:
             return False
-        self._call(self.svc.spreadsheets().values().clear(spreadsheetId=self.sid,
-                                                          range=f"'{tab}'"))
         self._call(self.svc.spreadsheets().values().update(
             spreadsheetId=self.sid, range=f"'{tab}'!A1", valueInputOption="RAW",
             body={"values": rows}))
+        self._call(self.svc.spreadsheets().values().clear(
+            spreadsheetId=self.sid, range=f"'{tab}'!A{len(rows) + 1}:ZZ"))
         self._last_write[tab] = now
         return True
 

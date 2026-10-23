@@ -104,7 +104,7 @@ def check_room(w):
     rows = w.ads.search("SELECT campaign.id FROM campaign WHERE campaign.status != 'REMOVED'",
                         "preflight")
     n_articles = w.con.execute("SELECT COUNT(*) n FROM articles").fetchone()["n"] or 8405
-    planned = -(-n_articles // 10)
+    planned = -(-n_articles // config.CAMPAIGN_MIN)   # worst case: smallest campaigns (P20)
     return len(rows) + planned <= 10000, f"{len(rows)} existing + ~{planned} planned"
 
 
@@ -152,7 +152,6 @@ def check_image_models(w):
 
 def check_test_campaign(w):
     """Create one paused test campaign with every setting, read it back, then remove it."""
-    from .gads import Ads  # noqa: F401  (real client only)
     ads = w.ads
     if config.DRY_RUN:
         return True, "dry run: skipped"

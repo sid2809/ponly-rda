@@ -89,11 +89,14 @@ class FakeClaude:
 
     def create_batch(self, requests):
         bid = "msgbatch_" + uuid.uuid4().hex[:10]
-        self.batches[bid] = {cid: (True, self._answer(p)) for cid, p in requests}
+        self.batches[bid] = {cid: ("ok", self._answer(p)) for cid, p in requests}
         return bid
 
     def batch_ended(self, bid):
         return True
+
+    def find_batch(self, created_after, created_before, n_requests):
+        return []
 
     def batch_results(self, bid):
         return self.batches[bid]
@@ -113,6 +116,9 @@ class FakeReplicate:
 
     def get(self, pid):
         return "succeeded", f"fake://{pid}", None
+
+    def cancel(self, pid):
+        pass
 
     def download(self, url):
         size = self.preds[url.split("//")[1]]
@@ -151,25 +157,32 @@ def fake_ads(con):
                     "square": f"customers/{self.cid}/assets/2"}
 
         def run_upload(self, wave, logos, quota_left):
+            """Same unit selection as the real upload; results applied directly."""
             if db.open_jobs(self.con, "gads"):
                 return -1
-            units = self.ops_for_wave(wave, logos)
-            chosen, total = [], 0
-            for u in units:
-                if total + len(u[0]) + 20 > quota_left:
+            if not self.has_work(wave) or quota_left < 50:
+                return 0
+            names = []
+            for c in self.con.execute("SELECT * FROM campaigns WHERE wave=? AND "
+                                      "status!='failed'", (wave,)).fetchall():
+                names += self.wanted_labels(c)
+            label_res = self.ensure_labels(names)
+            total = 0
+            for key, ops, idx in self.iter_units(wave, logos, label_res):
+                if total + len(ops) + 20 > quota_left:
                     break
-                chosen.append(u); total += len(u[0])
-            for ops, idx, _ in chosen:
-                for op, e in zip(ops, idx):
-                    field = op._pb.WhichOneof("operation")
-                    assert field, "empty operation"
-                    self.submitted.append(field)
-                    self.n += 1
-                    res = f"customers/{self.cid}/{e['t']}/{self.n}"
-                    if e["t"] == "ad":
-                        res = f"customers/{self.cid}/adGroupAds/1~{self.n}"
-                    self.apply_result(e, res, None)
-                db.log_ops(self.con, len(ops), "batch_ops")
+                with db.tx(self.con):
+                    for op, e in zip(ops, idx):
+                        field = op._pb.WhichOneof("operation")
+                        assert field, "empty operation"
+                        self.submitted.append(field)
+                        self.n += 1
+                        res = f"customers/{self.cid}/{e['t']}/{self.n}"
+                        if e["t"] == "ad":
+                            res = f"customers/{self.cid}/adGroupAds/1~{self.n}"
+                        self.apply_result(e, res, None)
+                    db.log_ops(self.con, len(ops), "batch_ops")
+                total += len(ops)
             return total
 
         def enable_wave(self, wave):

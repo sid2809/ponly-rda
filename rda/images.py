@@ -75,6 +75,9 @@ class ReplicateClient:
             out = out[0] if out else None
         return p.status, (str(out) if out else None), p.error
 
+    def cancel(self, pid):
+        self.r.predictions.cancel(pid)
+
     def download(self, url):
         r = requests.get(url, timeout=120)
         r.raise_for_status()
@@ -97,39 +100,56 @@ def start_prediction(con, client, article, model_key, extra_rule=""):
     return pid
 
 
+PREDICTION_TIMEOUT_S = 1800   # 30 min (R9): older unfinished predictions are cancelled
+
+
+def _fail_prediction(con, p, reason):
+    con.execute("UPDATE predictions SET state='failed' WHERE id=?", (p["id"],))
+    a = con.execute("SELECT image_attempts, status FROM articles WHERE id=?",
+                    (p["article_id"],)).fetchone()
+    if not a or a["status"] != "image_pending":
+        return
+    if a["image_attempts"] >= 3:
+        db.update_article(con, p["article_id"], status="skipped",
+                          skip_reason=f"image could not be produced: {reason}"[:300])
+    else:
+        db.update_article(con, p["article_id"], status="copy_done",
+                          error=f"image failed, will retry: {reason}"[:300])
+
+
 def poll_predictions(con, client):
-    """Fetch finished predictions; save crops; regenerate if the output expired."""
+    """Collect finished predictions. Never raises for one bad prediction (P5): corrupt
+    images, missing output, lost predictions and timeouts all fail just that prediction."""
     rows = con.execute("SELECT * FROM predictions WHERE state NOT IN ('done','failed')").fetchall()
     done = 0
     for p in rows:
+        age = time.time() - (p["created"] or 0)
+        if age > PREDICTION_TIMEOUT_S:
+            try:
+                client.cancel(p["id"])
+            except Exception:
+                pass
+            _fail_prediction(con, p, f"no result after {int(age // 60)} min")
+            continue
         try:
             status, url, err = client.get(p["id"])
-        except Exception as e:  # network hiccup: try next loop
-            print("replicate get error", p["id"], e)
+        except Exception as e:      # network / lost prediction: the timeout above handles it
+            print("replicate get error", p["id"], type(e).__name__, flush=True)
             continue
-        if status == "succeeded" and url:
+        if status == "succeeded":
+            if not url:
+                _fail_prediction(con, p, "succeeded with no output")
+                continue
             try:
                 raw = client.download(url)
-            except Exception as e:
-                # Outputs are deleted after 1 hour; if gone, mark failed so it is redone
-                if time.time() - p["created"] > 3600:
-                    con.execute("UPDATE predictions SET state='failed' WHERE id=?", (p["id"],))
-                    db.update_article(con, p["article_id"], status="copy_done",
-                                      error=f"image expired before download: {e}")
+                lp, sp = save_crops(p["article_id"], raw)
+            except Exception as e:  # corrupt / truncated / not an image
+                _fail_prediction(con, p, f"bad image: {type(e).__name__}: {e}")
                 continue
-            lp, sp = save_crops(p["article_id"], raw)
             con.execute("UPDATE predictions SET state='done' WHERE id=?", (p["id"],))
             db.update_article(con, p["article_id"], status="image_done", landscape_path=lp,
                               square_path=sp, error=None)
             done += 1
         elif status in ("failed", "canceled"):
-            con.execute("UPDATE predictions SET state='failed' WHERE id=?", (p["id"],))
-            a = con.execute("SELECT image_attempts FROM articles WHERE id=?",
-                            (p["article_id"],)).fetchone()
-            if a["image_attempts"] >= 2:
-                db.update_article(con, p["article_id"], status="skipped",
-                                  skip_reason=f"image generation failed: {err}")
-            else:
-                db.update_article(con, p["article_id"], status="copy_done",
-                                  error=f"image failed, retrying: {err}")
+            _fail_prediction(con, p, f"replicate {status}: {err}")
     return done
