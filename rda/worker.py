@@ -523,7 +523,23 @@ def build():
     return Worker(con, sheet, llm.Claude(), images.ReplicateClient(), Ads)
 
 
+REQUIRED_VARS = ["SHEET_ID", "GOOGLE_SERVICE_ACCOUNT_JSON", "GOOGLE_ADS_CUSTOMER_ID",
+                 "ANTHROPIC_API_KEY", "REPLICATE_API_TOKEN"]
+
+
+def missing_vars():
+    miss = [v for v in REQUIRED_VARS if not os.environ.get(v)]
+    if os.environ.get("GOOGLE_ADS_USE_SERVICE_ACCOUNT") != "1":
+        miss += [v for v in ("GOOGLE_ADS_CLIENT_ID", "GOOGLE_ADS_CLIENT_SECRET",
+                             "GOOGLE_ADS_REFRESH_TOKEN") if not os.environ.get(v)]
+    return miss
+
+
 def main():
+    # Wait (instead of crash-looping) until every Railway variable is present.
+    while not config.DRY_RUN and missing_vars():
+        print("Waiting for Railway variables:", ", ".join(missing_vars()), flush=True)
+        time.sleep(300)
     w = build()
     while True:
         try:

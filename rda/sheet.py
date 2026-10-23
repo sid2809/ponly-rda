@@ -19,7 +19,7 @@ SETTINGS_DEFAULTS = [
     ["Auto-apply recommendations off", False, "Tick after checking Recommendations > "
                                               "Auto-apply in Google Ads"],
     ["Pilot categories", "", "4 food categories, separated by ;  (blank = 4 largest)"],
-    ["Pause", False, "Tick to pause the worker (nothing new is started)"],
+    ["Pause", True, "Ticked = worker paused (nothing new is started). Untick to run."],
 ]
 OUTPUT_HEADER = ["ID", "Category", "Title", "Final URL", "Alcohol", "Alcohol reason", "Wave",
                  "Image model", "Campaign", "Ad group", "Status", "Error / skip reason",
