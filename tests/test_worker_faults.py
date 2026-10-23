@@ -22,9 +22,11 @@ def tmp():
         config.KEEP_IMAGES = True
         config.SHEETS_MIN_WRITE_INTERVAL_S = 0
         worker.BACKOFF_S = (0, 0, 0)          # no waiting in tests
+        old_gap, config.IMAGE_GAP_S = config.IMAGE_GAP_S, (0, 0)
         yield d
         (config.DRY_RUN, config.DATA_DIR, config.DB_PATH, config.IMG_DIR, config.KEEP_IMAGES,
          config.SHEETS_MIN_WRITE_INTERVAL_S, worker.BACKOFF_S) = old
+        config.IMAGE_GAP_S = old_gap
 
 
 def make(every=25, claude=None, rep=None):
@@ -444,3 +446,19 @@ def test_sheet_write_ok_when_tab_ends_at_last_row():
         "values": lambda self: Values()})()})()
     s.sid, s._last_write = "id", {}
     assert s.write("Output", [["a"], ["b"]], force=True) is True
+
+
+def test_image_requests_spaced(tmp):
+    config.IMAGE_GAP_S = (20, 30)
+    w = make(every=200)
+    con = w.con
+    for i in range(3):
+        con.execute("INSERT INTO articles(id,url,title,category,status,wave,image_model,copy_json) "
+                    "VALUES(?,?,?,?,?,?,?,?)", (f"e{i}eeeeeeeeee", "u", "T", "C", "copy_done", 1,
+                                                "minimax", '{"image_prompt": "p"}'))
+    waits = []
+    w.stop.wait = lambda s: waits.append(s) or False
+    w.step_images(1)
+    started = con.execute("SELECT COUNT(*) FROM predictions").fetchone()[0]
+    assert started >= 1 and all(20 <= x <= 30 for x in waits)
+    assert sum(waits) <= config.IMAGE_STEP_BUDGET_S            # loop never runs long

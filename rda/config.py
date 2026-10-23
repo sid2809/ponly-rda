@@ -69,3 +69,6 @@ EXPLORER_QUOTA_CAP = 2700
 LEASE_STALE_S = 900
 SHEETS_MIN_WRITE_INTERVAL_S = 120
 LOOP_SLEEP_S = 60
+# Siddharth 23 Oct: wait 20-30 s between Replicate image requests (rate limit)
+IMAGE_GAP_S = (20, 30)
+IMAGE_STEP_BUDGET_S = 60   # max time one loop spends starting images

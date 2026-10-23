@@ -10,6 +10,7 @@ Safety rules (code review fix plan P1-P21, R1-R21):
 import hashlib
 import json
 import os
+import random
 import signal
 import threading
 import time
@@ -654,6 +655,7 @@ class Worker:
             return
         todo = con.execute("SELECT * FROM articles WHERE wave=? AND status='copy_done' LIMIT ?",
                            (w, room)).fetchall()
+        began = time.time()
         for a in todo:
             model = a["image_model"] if w == 1 else self.chosen_model()
             if not model:
@@ -662,12 +664,25 @@ class Worker:
                 db.update_article(con, a["id"], status="skipped",
                                   skip_reason="image could not be produced after 3 attempts")
                 continue
-            if a["image_attempts"] >= 1:   # regeneration: record its cost
-                db.update_article(con, a["id"], regen_cost=(a["regen_cost"] or 0) +
-                                  config.IMAGE_MODELS[model]["est_usd"])
+            # 20-30 s between requests (Siddharth); the rest waits for the next loop
+            wait = (db.kv_get(con, "last_image_request", 0)
+                    + random.uniform(*config.IMAGE_GAP_S) - time.time())
+            if wait > 0:
+                if time.time() + wait - began > config.IMAGE_STEP_BUDGET_S:
+                    return
+                if self.stop.wait(wait):
+                    return
+                self.heartbeat()
             extra = (" Absolutely no writing or symbols of any kind on any surface."
                      if a["check_failed_once"] else "")
-            images.start_prediction(con, self.rep, a, model, extra)
+            regen = a["image_attempts"] >= 1
+            try:
+                images.start_prediction(con, self.rep, a, model, extra)
+            finally:
+                db.kv_set(con, "last_image_request", time.time())
+            if regen:   # regeneration: record its cost (only once it was really started)
+                db.update_article(con, a["id"], regen_cost=(a["regen_cost"] or 0) +
+                                  config.IMAGE_MODELS[model]["est_usd"])
 
     # ----------------------------------------------------------- image check
     def _apply_check_results(self, res):
