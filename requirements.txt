@@ -1,0 +1,8 @@
+google-ads==34.0.0
+google-api-python-client>=2.100
+google-auth>=2.20
+anthropic==2.1.0
+replicate==1.0.7
+pillow>=10
+requests>=2.31
+pytest>=8

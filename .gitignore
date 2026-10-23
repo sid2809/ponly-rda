@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+data_csv/
+*.sqlite*
+.env
+*.json.key
