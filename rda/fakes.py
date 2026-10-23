@@ -79,12 +79,9 @@ class FakeClaude:
         if "themes" in schema:
             return {"themes": ["Classic Favorites", "Savory Mains", "Sweet Treats",
                                "Quick Bites", "Hearty Dishes"]}
-        if "assignments" in schema:
-            lines = [l for l in text.splitlines() if l[:1].isdigit() and ". " in l]
-            th = ["Classic Favorites", "Savory Mains", "Sweet Treats", "Quick Bites",
-                  "Hearty Dishes"]
-            return {"assignments": [{"n": int(l.split(".")[0]), "theme": th[hash(l) % 5]}
-                                    for l in lines]}
+        if "a" in schema and "pass" not in schema:
+            lines = [l for l in text.split("\n\n")[-1].splitlines() if l[:1].isdigit() and ". " in l]
+            return {"a": [[int(l.split(".")[0]), hash(l) % 5] for l in lines]}
         raise ValueError("unknown schema")
 
     def sync_json(self, params):

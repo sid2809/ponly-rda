@@ -33,13 +33,11 @@ THEMES_SCHEMA = {
     "properties": {"themes": {"type": "array", "items": {"type": "string"}}},
     "required": ["themes"], "additionalProperties": False,
 }
-ASSIGN_SCHEMA = {
+ASSIGN_SCHEMA = {   # compact: article number -> theme number (short output, no truncation)
     "type": "object",
-    "properties": {"assignments": {"type": "array", "items": {
-        "type": "object",
-        "properties": {"n": {"type": "integer"}, "theme": {"type": "string"}},
-        "required": ["n", "theme"], "additionalProperties": False}}},
-    "required": ["assignments"], "additionalProperties": False,
+    "properties": {"a": {"type": "array", "items": {
+        "type": "array", "items": {"type": "integer"}}}},
+    "required": ["a"], "additionalProperties": False,
 }
 
 
@@ -147,19 +145,32 @@ no punctuation except '&'. Themes must not overlap.
     if cache is not None:
         cache[category] = themes
     assigned = {}
-    per = 1500  # titles per assignment call (~20k tokens)
-    for start in range(0, n, per):
-        part = titles[start:start + per]
-        lines = "\n".join(f"{i}. {t}" for i, t in enumerate(part))
-        res = claude.sync_json(_params(
-            f"""Assign each numbered recipe title to exactly one theme from this list
-(use the theme text exactly):
-{json.dumps(themes)}
+    numbered_themes = "\n".join(f"{k}. {t}" for k, t in enumerate(themes))
 
-{lines}""", ASSIGN_SCHEMA, 16000 + 12 * len(part)))
-        for item in res["assignments"]:
-            i = item["n"]
-            if 0 <= i < len(part):
-                t = item["theme"] if item["theme"] in themes else themes[0]
-                assigned[start + i] = t
+    def assign(start, part, depth=0):
+        lines = "\n".join(f"{i}. {t}" for i, t in enumerate(part))
+        try:
+            res = claude.sync_json(_params(
+                f"""Themes:
+{numbered_themes}
+
+Assign each numbered recipe title below to exactly one theme. Answer with pairs
+[title number, theme number] for every title, e.g. {{"a": [[0, 3], [1, 0]]}}.
+
+{lines}""", ASSIGN_SCHEMA, 8000))
+            pairs = res["a"]
+        except Exception:
+            if depth >= 3 or len(part) <= 10:
+                raise
+            half = len(part) // 2            # answer cut off or invalid: retry in halves
+            assign(start, part[:half], depth + 1)
+            assign(start + half, part[half:], depth + 1)
+            return
+        for pr in pairs:
+            if len(pr) == 2 and 0 <= pr[0] < len(part) and 0 <= pr[1] < len(themes):
+                assigned[start + pr[0]] = themes[pr[1]]
+
+    per = 150   # titles per call keeps each answer short
+    for start in range(0, n, per):
+        assign(start, titles[start:start + per])
     return themes, [assigned.get(i, themes[0]) for i in range(n)]
