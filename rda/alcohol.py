@@ -22,12 +22,15 @@ _RX = re.compile(r"(?<![a-z])(" + "|".join(re.escape(k) for k in _KW) + r")(?![a
 
 
 def keyword_check(title):
-    """Returns (is_alcohol, reason) or (None, None) if keywords say nothing."""
+    """Returns (True, reason), (False, reason) for decided food, or (None, None) = ask Haiku."""
     t = title.lower()
-    for p in NOT_ALCOHOL_PHRASES:
+    decided = [p for p in NOT_ALCOHOL_PHRASES if p in t]
+    for p in decided:
         t = t.replace(p, " ")
     m = _RX.search(t)
     if not m:
+        if decided:   # food by Siddharth's decision (22 Oct); never sent to Haiku
+            return False, f"not alcohol: '{decided[0]}' dish (Siddharth's decision)"
         return None, None
     word = m.group(1).lower()
     group = "A" if word in A else "B" if word in B else "C"

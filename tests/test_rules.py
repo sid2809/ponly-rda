@@ -101,3 +101,12 @@ def test_small_pools_not_split_across_waves():
     plan = split.assign_waves(arts, set())
     waves = {plan[f"R{i}"][0] for i in range(9)}
     assert len(waves) == 1
+
+
+def test_cocktail_dishes_decided_food():
+    for t in ["Classic Shrimp Cocktail", "Avocado and Shrimp Cocktail Cups",
+              "Tropical Breeze Fruit Cocktail Cake"]:
+        hit, why = alcohol.keyword_check(t)
+        assert hit is False and "decision" in why, t
+    assert alcohol.keyword_check("Bourbon Shrimp Cocktail")[0] is True
+    assert alcohol.keyword_check("Kale Salad")[0] is None

@@ -354,7 +354,7 @@ class Ads:
 
     # ---------- logos ----------
     def upload_logos(self):
-        logos = db.kv_get(self.con, "logos")
+        logos = db.kv_get(self.con, f"logos_{self.cid}")
         if logos:
             return logos
         svc = self.client.get_service("AssetService")
@@ -370,7 +370,7 @@ class Ads:
         r = svc.mutate_assets(customer_id=self.cid, operations=ops)
         db.log_ops(self.con, 2, "logos")
         logos = {"landscape": r.results[0].resource_name, "square": r.results[1].resource_name}
-        db.kv_set(self.con, "logos", logos)
+        db.kv_set(self.con, f"logos_{self.cid}", logos)
         return logos
 
     # ---------- enable ----------

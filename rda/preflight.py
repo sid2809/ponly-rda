@@ -55,14 +55,13 @@ def check_alcohol(w):
     wrong = []
     for t in alcohol.MUST_TAG:
         hit, _ = alcohol.keyword_check(t)
-        if not hit:
-            r = w.claude.sync_json(llm.alcohol_params(t))
-            hit = r["alcohol"]
+        if hit is None:   # same path as the real run: undecided titles go to Haiku
+            hit = w.claude.sync_json(llm.alcohol_params(t))["alcohol"]
         if not hit:
             wrong.append(f"missed {t}")
     for t in alcohol.MUST_NOT_TAG:
         hit, _ = alcohol.keyword_check(t)
-        if not hit:
+        if hit is None:
             hit = w.claude.sync_json(llm.alcohol_params(t))["alcohol"]
         if hit:
             wrong.append(f"wrongly tagged {t}")

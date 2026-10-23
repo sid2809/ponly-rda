@@ -68,7 +68,9 @@ class Sheet:
                     "range": {"sheetId": sid, "startRowIndex": r, "endRowIndex": r + 1,
                               "startColumnIndex": 1, "endColumnIndex": 2},
                     "rule": {"condition": {"type": "BOOLEAN"}}}} for r in boxes]}))
-        if not self.read("Input"):
+        head = self._call(self.svc.spreadsheets().values().get(
+            spreadsheetId=self.sid, range="'Input'!A1:C1")).get("values", [])
+        if not head:   # only the first row is read, not the whole tab
             self.write("Input", [["URL", "Title", "Category"]], force=True)
 
     def read(self, tab):

@@ -4,9 +4,6 @@ import json
 import os
 import time
 import traceback
-from concurrent.futures import ThreadPoolExecutor
-
-import requests
 
 from . import alcohol, config, db, images, lint, llm, split
 from .sheet import OUTPUT_HEADER
@@ -43,16 +40,7 @@ class Worker:
     # ------------------------------------------------------------------ load
     def step_load(self):
         if db.kv_get(self.con, "waves_assigned"):
-            known = {r["id"] for r in self.con.execute("SELECT id FROM articles")}
-            new = [r for r in self.sheet.read("Input")[1:] if len(r) >= 3 and
-                   article_id(str(r[0])) not in known]
-            for i, r in enumerate(new):
-                self.con.execute(
-                    "INSERT OR IGNORE INTO articles(id,row_num,url,title,category,status,skip_reason)"
-                    " VALUES(?,?,?,?,?,'skipped','added after waves were planned')",
-                    (article_id(str(r[0])), 0, str(r[0]).strip(), str(r[1]).strip(),
-                     str(r[2]).strip()))
-            return
+            return   # article list is fixed once waves are planned
         rows = self.sheet.read("Input")[1:]
         seen_titles = {r["title"].lower() for r in self.con.execute(
             "SELECT title FROM articles WHERE status!='skipped' OR skip_reason!='duplicate title'")}
@@ -71,31 +59,14 @@ class Worker:
             seen_titles.add(title.lower())
             self.con.execute("INSERT INTO articles(id,row_num,url,title,category) VALUES(?,?,?,?,?)",
                              (aid, n, url, title, cat))
-        queued = self.con.execute("SELECT id,url FROM articles WHERE status='queued'").fetchall()
-        if queued:
-            self.log(f"URL check: {len(queued)} articles")
-            with ThreadPoolExecutor(8) as ex:
-                results = list(ex.map(lambda q: (q["id"], self.check_url(q["url"])), queued))
-            for aid, (ok, final, why) in results:
-                if ok:
-                    db.update_article(self.con, aid, status="url_ok", final_url=final)
-                else:
-                    db.update_article(self.con, aid, status="skipped", skip_reason=why)
-
-    def check_url(self, url):
-        if config.DRY_RUN:
-            return True, url, None
-        try:
-            r = requests.get(url, allow_redirects=True, timeout=20, stream=True,
-                             headers={"User-Agent": "Mozilla/5.0"})
-            r.close()
-            if r.status_code != 200:
-                return False, None, f"URL returned {r.status_code}"
-            if not r.url.startswith(config.DOMAIN_PREFIX):
-                return False, None, f"URL ends off ponly.com: {r.url}"
-            return True, r.url, None
-        except Exception as e:
-            return False, None, f"URL check failed: {type(e).__name__}"
+        # No URL fetching (Siddharth, 23 Oct): URLs are used as given; Google's ad review
+        # flags broken landing pages. Only a text check that the URL is on ponly.com.
+        for q in self.con.execute("SELECT id,url FROM articles WHERE status='queued'").fetchall():
+            if q["url"].startswith(config.DOMAIN_PREFIX):
+                db.update_article(self.con, q["id"], status="url_ok", final_url=q["url"])
+            else:
+                db.update_article(self.con, q["id"], status="skipped",
+                                  skip_reason="URL is not on ponly.com")
 
     # --------------------------------------------------------------- alcohol
     def step_alcohol(self):
@@ -120,8 +91,8 @@ class Worker:
         reqs = []
         for a in todo:
             hit, why = alcohol.keyword_check(a["title"])
-            if hit:
-                db.update_article(con, a["id"], alcohol=1, alcohol_reason=why, status="tagged")
+            if hit is not None:
+                db.update_article(con, a["id"], alcohol=int(hit), alcohol_reason=why, status="tagged")
             else:
                 reqs.append((f"alc-{a['id']}", llm.alcohol_params(a["title"])))
         if reqs:
