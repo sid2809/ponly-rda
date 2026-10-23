@@ -540,8 +540,15 @@ def main():
     while not config.DRY_RUN and missing_vars():
         print("Waiting for Railway variables:", ", ".join(missing_vars()), flush=True)
         time.sleep(300)
+    print("All Railway variables present. Connecting to the Sheet...", flush=True)
     w = build()
+    w.log("Worker started. Sheet tabs ready.")
+    was_paused = None
     while True:
+        paused = w.s_bool("Pause") if w.settings else None
+        if paused != was_paused and paused is not None:
+            w.log("PAUSED (untick Pause in Settings to run)" if paused else "RUNNING")
+            was_paused = paused
         try:
             w.tick()
         except Exception:
