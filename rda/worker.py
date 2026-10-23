@@ -487,6 +487,8 @@ class Worker:
 
     # ------------------------------------------------------------------ loop
     def tick(self):
+        if hasattr(self.sheet, "ensure_tabs"):
+            self.sheet.ensure_tabs()   # recreates any tab that was deleted (Pause starts ticked)
         self.settings = self.sheet.read_settings()
         if self.s_bool("Pause"):
             self.write_reports()
