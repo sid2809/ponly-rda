@@ -299,7 +299,13 @@ class Worker:
                 aid = cid.split("-")[1]
                 a = con.execute("SELECT * FROM articles WHERE id=?", (aid,)).fetchone()
                 if not ok:
-                    db.update_article(con, aid, status="image_done", error=f"check API: {data}")
+                    n = (a["check_api_errors"] or 0) + 1
+                    if n >= 2:   # Siddharth: give up after 2 failed check attempts
+                        db.update_article(con, aid, status="skipped", check_api_errors=n,
+                                          skip_reason=f"image check could not run twice: {data}"[:300])
+                    else:
+                        db.update_article(con, aid, status="image_done", check_api_errors=n,
+                                          error=f"check API: {data}")
                 elif data["pass"]:
                     db.update_article(con, aid, status="checked", error=None)
                 elif not a["check_failed_once"]:
@@ -404,7 +410,10 @@ class Worker:
         if not con.execute("SELECT 1 FROM campaigns WHERE campaign_res IS NOT NULL").fetchone():
             return
         last = db.kv_get(con, "last_sync", 0)
-        if time.time() - last < 86400 and not db.kv_get(con, "sync_now"):
+        # every 6 h while a wave is live but has not passed yet (pilot results sooner), else daily
+        waiting = any(db.kv_get(con, f"enabled_{w}") and not self.wave_passed(w) for w in (1, 2, 3))
+        interval = 6 * 3600 if waiting else 86400
+        if time.time() - last < interval and not db.kv_get(con, "sync_now"):
             return
         since = db.kv_get(con, "enabled_date_1")
         on = self.ads.sync(since)
