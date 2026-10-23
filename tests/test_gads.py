@@ -48,6 +48,7 @@ class StubBatch:
 
 
 def setup(tmp, fail_types=()):
+    config.KEEP_IMAGES = False
     config.IMG_DIR = os.path.join(tmp, "img")
     os.makedirs(config.IMG_DIR, exist_ok=True)
     con = db.connect(os.path.join(tmp, "t.sqlite"))

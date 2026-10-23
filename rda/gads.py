@@ -237,7 +237,7 @@ class Ads:
             db.update_article(con, k, **{("landscape_asset" if t == "assetL" else
                                           "square_asset"): resource_name})
             a = con.execute("SELECT * FROM articles WHERE id=?", (k,)).fetchone()
-            if a["landscape_asset"] and a["square_asset"] and k != "preflight":
+            if a["landscape_asset"] and a["square_asset"] and k != "preflight" and not config.KEEP_IMAGES:
                 for p in (a["landscape_path"], a["square_path"]):   # Google has it now
                     if p and os.path.exists(p):
                         os.remove(p)

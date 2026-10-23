@@ -8,7 +8,9 @@ ASSETS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "assets")
 LOGO_LANDSCAPE = os.path.join(ASSETS_DIR, "logo_landscape.png")
 LOGO_SQUARE = os.path.join(ASSETS_DIR, "logo_square.png")
 
-DRY_RUN = os.environ.get("DRY_RUN", "0") == "1"  # fake APIs, nothing paid or created
+DRY_RUN = os.environ.get("DRY_RUN", "0") == "1"
+# Keep every generated image on the volume after upload (so nothing is ever paid for twice)
+KEEP_IMAGES = os.environ.get("KEEP_IMAGES", "1") == "1"  # fake APIs, nothing paid or created
 
 # --- Google ---
 SHEET_ID = os.environ.get("SHEET_ID", "")

@@ -379,8 +379,10 @@ class Worker:
         if n == 0 and not db.open_jobs(con, "gads"):
             if self.ads.ops_for_wave(w, logos):
                 return  # work left but no quota now; wait for the 24 h window
-            for a in con.execute("SELECT * FROM articles WHERE wave=? AND status='uploaded'", (w,)):
-                self._delete_images(a)
+            if not config.KEEP_IMAGES:
+                for a in con.execute("SELECT * FROM articles WHERE wave=? AND status='uploaded'",
+                                     (w,)):
+                    self._delete_images(a)
             db.kv_set(con, f"uploaded_{w}", True)
             self.log(f"wave {w}: upload complete")
 
