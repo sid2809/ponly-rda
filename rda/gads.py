@@ -46,6 +46,13 @@ def _chunks(seq, n=200):
         yield seq[i:i + n]
 
 
+def asset_name(art, tag):
+    """Image asset name. Images made again get a new version, so names stay unique
+    (first-run assets were named without the version)."""
+    v = art["image_attempts"] or 1
+    return f"ponly {art['id']} {tag}" if v <= 1 else f"ponly {art['id']} {tag} v{v}"
+
+
 class QuotaExhausted(Exception):
     pass
 
@@ -297,7 +304,7 @@ class Ads:
                             op = self._op()
                             s = op.asset_operation.create
                             s.resource_name = res
-                            s.name = f"ponly {art['id']} {tag}"
+                            s.name = asset_name(art, tag)
                             s.type_ = self.e.AssetTypeEnum.IMAGE
                             s.image_asset.data = data
                             art_ops.append(op); art_idx.append({"t": "asset" + tag, "k": art["id"]})
@@ -692,7 +699,7 @@ class Ads:
         arts = [dict(r) for r in con.execute(
             "SELECT a.* FROM articles a JOIN adgroups g ON a.adgroup_key=g.key JOIN campaigns c ON "
             "g.campaign_key=c.key WHERE c.wave=? AND a.status='planned'", (wave,))]
-        asset_names = [f"ponly {a['id']} {t}" for a in arts for t in ("L", "S")]
+        asset_names = [asset_name(a, t) for a in arts for t in ("L", "S")]
         for part in _chunks(asset_names):
             q = ",".join(_q(n) for n in part)
             for x in self.search(f"SELECT asset.resource_name, asset.name FROM asset WHERE "
@@ -733,7 +740,7 @@ class Ads:
                         if a["adgroup_key"] != g["key"]:
                             continue
                         for tag, col in (("L", "landscape_asset"), ("S", "square_asset")):
-                            r = found["asset"].get(f"ponly {a['id']} {tag}")
+                            r = found["asset"].get(asset_name(a, tag))
                             if r and not a[col]:
                                 db.update_article(con, a["id"], **{col: r})
                         ad = found["ad"].get((gr, a["final_url"]))
@@ -824,6 +831,43 @@ class Ads:
                                     (time.time(), r["key"]))
         return enabled
 
+    # ---------- remove campaigns (pilot re-run) ----------
+    def remove_campaigns(self, camps):
+        """Remove campaigns, then their budgets. Returns ({key: error or None}, budget_errors).
+        Removed campaigns cannot be restored in Google Ads."""
+        if not camps:
+            return {}, {}
+        ops = []
+        for c in camps:
+            op = self.client.get_type("CampaignOperation")
+            op.remove = c["campaign_res"]
+            ops.append(op)
+        resp = self.client.get_service("CampaignService").mutate_campaigns(request={
+            "customer_id": self.cid, "operations": ops, "partial_failure": True})
+        db.log_ops(self.con, len(ops), "remove")
+        failed = self.partial_failures(resp)
+        out = {}
+        for i, c in enumerate(camps):
+            ok = (i not in failed and None not in failed and i < len(resp.results)
+                  and resp.results[i].resource_name)
+            out[c["key"]] = None if ok else (failed.get(i) or failed.get(None) or "no result")
+        bud = [c for c in camps if out[c["key"]] is None and c["budget_res"]]
+        berr = {}
+        if bud:
+            bops = []
+            for c in bud:
+                op = self.client.get_type("CampaignBudgetOperation")
+                op.remove = c["budget_res"]
+                bops.append(op)
+            r = self.client.get_service("CampaignBudgetService").mutate_campaign_budgets(
+                request={"customer_id": self.cid, "operations": bops, "partial_failure": True})
+            db.log_ops(self.con, len(bops), "remove")
+            bf = self.partial_failures(r)
+            berr = {bud[i]["key"]: m for i, m in bf.items() if i is not None}
+            if None in bf:
+                berr = {c["key"]: bf[None] for c in bud}
+        return out, berr
+
     # ---------- time zone (P19) ----------
     def account_today(self):
         tz = db.kv_get(self.con, f"tz_{self.cid}")
@@ -841,7 +885,8 @@ class Ads:
     def sync(self, since_date):
         con = self.con
         ids = [r["campaign_res"].split("/")[-1] for r in con.execute(
-            "SELECT campaign_res FROM campaigns WHERE campaign_res IS NOT NULL")]
+            "SELECT campaign_res FROM campaigns WHERE campaign_res IS NOT NULL AND "
+            "status!='removed'")]
         by_ad = {r["ad_resource"]: r["id"] for r in con.execute(
             "SELECT id, ad_resource FROM articles WHERE ad_resource IS NOT NULL")}
         today = self.account_today()

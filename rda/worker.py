@@ -632,7 +632,7 @@ class Worker:
             reqs.append((f"copy-{a['id']}-{a['copy_attempts'] + 1}",
                          llm.copy_params(a["title"], a["category"], a["theme"], problems,
                                          big=bool((a["big_tokens"] or 0) & BIG["copy"]))))
-        if w == 1:   # pilot: regular API, results in minutes
+        if w == 1 and not db.kv_get(con, "pilot_use_batch"):   # pilot: regular API
             self.log(f"wave 1: copy for {len(reqs)} articles (regular API)")
             for part in _chunks(reqs, COPY_CHUNK):
                 if self.stop.is_set():
@@ -663,6 +663,12 @@ class Worker:
             if a["image_attempts"] >= 3:
                 db.update_article(con, a["id"], status="skipped",
                                   skip_reason="image could not be produced after 3 attempts")
+                continue
+            if (w == 1 and db.kv_get(con, "reuse_images_1") and not a["check_failed_once"]
+                    and a["landscape_path"] and a["square_path"]
+                    and os.path.exists(a["landscape_path"]) and os.path.exists(a["square_path"])):
+                db.update_article(con, a["id"], status="image_done",
+                                  note="image reused from the first pilot run (no new cost)")
                 continue
             # 20-30 s between requests (Siddharth); the rest waits for the next loop
             wait = (db.kv_get(con, "last_image_request", 0)
@@ -706,6 +712,8 @@ class Worker:
                 db.update_article(con, a["id"], status="checked", error=None)
             elif not a["check_failed_once"]:
                 self._delete_images(a)
+                if (a["note"] or "").startswith("image reused"):
+                    db.update_article(con, a["id"], note=None)   # a new image will be made
                 db.update_article(con, a["id"], status="copy_done", check_failed_once=1,
                                   error="image check: " + "; ".join(problems)[:300])
             else:
@@ -742,7 +750,7 @@ class Worker:
                                               big=bool((a["big_tokens"] or 0) & BIG["check"]))))
             if not reqs:
                 continue
-            if w == 1:   # pilot: regular API, results in minutes
+            if w == 1 and not db.kv_get(con, "pilot_use_batch"):   # pilot: regular API
                 self.log(f"wave 1: image check for {len(reqs)} articles (regular API)")
                 self._run_sync("check", w, reqs, self._apply_check_results)
             else:
@@ -826,7 +834,8 @@ class Worker:
     # ------------------------------------------------------------------ sync
     def step_sync(self):
         con = self.con
-        if not con.execute("SELECT 1 FROM campaigns WHERE campaign_res IS NOT NULL").fetchone():
+        if not con.execute("SELECT 1 FROM campaigns WHERE campaign_res IS NOT NULL AND "
+                           "status!='removed'").fetchone():
             return
         if time.time() < db.kv_get(con, "quota_wait_until", 0):
             return
@@ -915,8 +924,9 @@ class Worker:
         failed = con.execute("SELECT name, error FROM campaigns WHERE status='failed'").fetchall()
         lost = [r["k"][9:] + ": " + json.loads(r["v"]) for r in con.execute(
             "SELECT k, v FROM kv WHERE k LIKE 'lost_job_%'")]
-        rows += [["Campaigns created", count("SELECT COUNT(*) FROM campaigns WHERE "
-                                             "campaign_res IS NOT NULL")],
+        rows += [["Campaigns created (not removed)", count("SELECT COUNT(*) FROM campaigns WHERE "
+                                             "campaign_res IS NOT NULL AND status!='removed'")],
+                 ["Pilot re-run", json.dumps(db.kv_get(con, "pilot_rerun", {}))[:45000]],
                  ["Campaigns FAILED (see Campaign map > Error)", len(failed)],
                  ["Failed campaigns", "; ".join(f"{r['name']}: {r['error']}" for r in failed)[:45000]],
                  ["Campaigns with a pending error",
@@ -992,6 +1002,11 @@ class Worker:
             self.read_settings()
             if self.paused():
                 return
+            if not db.kv_get(self.con, "pilot_rerun_done"):
+                from . import rerun
+                self.run_step("pilot_rerun", rerun.run, self)
+                if not db.kv_get(self.con, "pilot_rerun_done"):
+                    return                       # never build on a half-finished reset
             if not db.kv_get(self.con, "preflight_passed"):
                 from . import preflight
                 self.run_step("preflight", preflight.run, self)

@@ -107,7 +107,7 @@ def run(w):
     def duplicates():
         """Count every entity of our campaigns in the account; anything >1 is a duplicate."""
         camps = [dict(r) for r in con.execute("SELECT * FROM campaigns WHERE campaign_res IS "
-                                              "NOT NULL")]
+                                              "NOT NULL AND status!='removed'")]
         if not camps:
             return True, "no campaigns yet"
         from .gads import _chunks, _q
@@ -197,8 +197,9 @@ def run(w):
                              "adgroup_res IS NOT NULL").fetchall():
             if not excl.get(g["adgroup_res"]):
                 mism.append(f"alcohol ad group {g['adgroup_res']} has no 18-24 exclusion")
-        a_names = [f"ponly {r['id']} {t}" for r in con.execute(
-            "SELECT id FROM articles WHERE status='uploaded'") for t in ("L", "S")]
+        from .gads import asset_name
+        a_names = [asset_name(r, t) for r in con.execute(
+            "SELECT id, image_attempts FROM articles WHERE status='uploaded'") for t in ("L", "S")]
         acnt = {}
         for part in _chunks(a_names):
             q = ",".join(_q(n) for n in part)

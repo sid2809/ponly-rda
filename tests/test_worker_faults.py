@@ -462,3 +462,50 @@ def test_image_requests_spaced(tmp):
     started = con.execute("SELECT COUNT(*) FROM predictions").fetchone()[0]
     assert started >= 1 and all(20 <= x <= 30 for x in waits)
     assert sum(waits) <= config.IMAGE_STEP_BUDGET_S            # loop never runs long
+
+
+def test_pilot_rerun_end_to_end(tmp):
+    """Wave 1 uploaded -> re-run: old campaigns removed (kept as 'removed', new numbers),
+    copy + check via the Batch API, images reused, no duplicate, cancel test recorded."""
+    w = make(every=25)
+    con = w.con
+    for _ in range(200):
+        db.kv_set(con, "preflight_last_try", 0)
+        w.tick()
+        if db.kv_get(con, "uploaded_1"):
+            break
+    assert db.kv_get(con, "uploaded_1")
+    assert db.kv_get(con, "pilot_rerun", {}).get("skipped")   # fresh DB: did nothing
+    first_camps = {r["name"] for r in con.execute("SELECT name FROM campaigns WHERE wave=1")}
+    first_ads = w.ads.submitted.count("ad_group_ad_operation")
+    assets_before = w.ads.submitted.count("asset_operation")
+    preds_before = con.execute("SELECT COUNT(*) FROM predictions").fetchone()[0]
+    batches_before = len(w.claude.batches)
+    con.execute("DELETE FROM kv WHERE k='pilot_rerun_done'")
+    con.execute("DELETE FROM kv WHERE k='pilot_rerun'")
+    for _ in range(60):
+        w.tick()
+        if db.kv_get(con, "uploaded_1"):
+            break
+    rep = db.kv_get(con, "pilot_rerun")
+    assert rep["removed"] == len(first_camps) and rep["cancel_test"]["result"] == "OK: cancelled"
+    assert sorted(w.ads.removed) == sorted(r[0] for r in con.execute(
+        "SELECT campaign_res FROM campaigns WHERE status='removed'"))
+    new_camps = {r["name"] for r in con.execute("SELECT name FROM campaigns WHERE wave=1")}
+    assert new_camps and not (new_camps & first_camps)          # no name reused
+    assert len(w.claude.batches) > batches_before                # copy/check via Batch API
+    new_img = {r[0] for r in con.execute(
+        "SELECT article_id FROM predictions ORDER BY created LIMIT -1 OFFSET ?", (preds_before,))}
+    st = {r[0]: r[1] for r in con.execute("SELECT status, COUNT(*) FROM articles WHERE wave=1 "
+                                          "GROUP BY status")}
+    assert set(st) <= {"uploaded", "skipped", "error"}, st
+    up = st.get("uploaded", 0)
+    assert w.ads.submitted.count("ad_group_ad_operation") - first_ads == up
+    # only articles without a usable image made a new one; reused images uploaded no new asset
+    new_assets = w.ads.submitted.count("asset_operation") - assets_before
+    uploaded = {r[0]: r[1] for r in con.execute("SELECT id, note FROM articles WHERE wave=1 AND "
+                                                "status='uploaded'")}
+    assert new_assets == 2 * len(new_img & set(uploaded))
+    assert all((n or "").startswith("image reused") for a, n in uploaded.items()
+               if a not in new_img)
+    assert db.kv_get(con, "pilot_rerun_done")

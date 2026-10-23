@@ -147,8 +147,10 @@ def poll_predictions(con, client):
                 _fail_prediction(con, p, f"bad image: {type(e).__name__}: {e}")
                 continue
             con.execute("UPDATE predictions SET state='done' WHERE id=?", (p["id"],))
+            # new image: any Google Ads image asset stored for an older image must not be used
             db.update_article(con, p["article_id"], status="image_done", landscape_path=lp,
-                              square_path=sp, error=None)
+                              square_path=sp, error=None, landscape_asset=None,
+                              square_asset=None)
             done += 1
         elif status in ("failed", "canceled"):
             _fail_prediction(con, p, f"replicate {status}: {err}")

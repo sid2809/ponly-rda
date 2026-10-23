@@ -115,10 +115,12 @@ class FakeReplicate:
         return pid
 
     def get(self, pid):
+        if pid in getattr(self, "cancelled", set()):
+            return "canceled", None, None
         return "succeeded", f"fake://{pid}", None
 
     def cancel(self, pid):
-        pass
+        self.cancelled = getattr(self, "cancelled", set()) | {pid}
 
     def download(self, url):
         size = self.preds[url.split("//")[1]]
@@ -184,6 +186,11 @@ def fake_ads(con):
                     db.log_ops(self.con, len(ops), "batch_ops")
                 total += len(ops)
             return total
+
+        def remove_campaigns(self, camps):
+            db.log_ops(self.con, len(camps), "remove")
+            self.removed = getattr(self, "removed", []) + [c["campaign_res"] for c in camps]
+            return {c["key"]: None for c in camps}, {}
 
         def enable_wave(self, wave):
             n = self.con.execute("UPDATE campaigns SET status='enabled' WHERE wave=? AND "

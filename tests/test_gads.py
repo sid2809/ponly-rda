@@ -141,8 +141,25 @@ class Stub:
         return NS(results=out, partial_failure_error=self._failure(bad, "DUPLICATE_NAME")
                   if bad else None)
 
+    def mutate_campaign_budgets(self, request):
+        out = []
+        for op in request["operations"]:
+            self.ent["budget"] = [b for b in self.ent["budget"] if b[1] != op.remove]
+            out.append(NS(resource_name=op.remove))
+        return NS(results=out, partial_failure_error=None)
+
     def mutate_campaigns(self, request):
         out, bad = [], []
+        if request["operations"] and request["operations"][0].remove:
+            for i, op in enumerate(request["operations"]):
+                if op.remove in self.enable_fail:
+                    bad.append(i)
+                    out.append(NS(resource_name=""))
+                    continue
+                self.ent["campaign"] = [c for c in self.ent["campaign"] if c[1] != op.remove]
+                out.append(NS(resource_name=op.remove))
+            return NS(results=out, partial_failure_error=self._failure(bad, "cannot remove")
+                      if bad else None)
         for i, op in enumerate(request["operations"]):
             if op.update.resource_name in self.enable_fail:
                 bad.append(i)
@@ -529,3 +546,16 @@ def test_live_check_runs_and_finds_duplicates():
         livecheck.run(w)
         res = db.kv_get(con, "live_check")["results"]
         assert any(r.startswith("FAIL Google Ads duplicates") and "ad x2" in r for r in res)
+
+
+def test_remove_campaigns_real_signature_and_partial_failure():
+    with tempfile.TemporaryDirectory() as tmp:
+        con, ads, stub, logos = setup(tmp)
+        drive(ads, logos)
+        c = dict(con.execute("SELECT * FROM campaigns").fetchone())
+        errs, berr = ads.remove_campaigns([c])
+        assert errs == {"c1": None} and berr == {}
+        assert not stub.ent["campaign"] and not stub.ent["budget"]
+        stub.enable_fail = {c["campaign_res"]}
+        errs, _ = ads.remove_campaigns([c])
+        assert "cannot remove" in errs["c1"]
