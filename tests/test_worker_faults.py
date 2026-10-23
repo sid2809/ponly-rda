@@ -417,3 +417,30 @@ def test_sheet_write_updates_before_clearing():
     s.sid, s._last_write = "id", {}
     s.write("Output", [["a"], ["b"]], force=True)
     assert calls == ["update", ("clear-range", "'Output'!A3:ZZ"), "clear"]
+
+
+def test_sheet_write_ok_when_tab_ends_at_last_row():
+    from rda import sheet as sheet_mod
+
+    class Req:
+        def __init__(self, fail=False):
+            self.fail = fail
+
+        def execute(self):
+            if self.fail:
+                raise RuntimeError('HttpError 400 "Range (Output!A3:ZZ) exceeds grid limits. '
+                                   'Max rows: 2, max columns: 26"')
+            return {}
+
+    class Values:
+        def update(self, **k):
+            return Req()
+
+        def clear(self, **k):
+            return Req(fail=True)
+
+    s = sheet_mod.Sheet.__new__(sheet_mod.Sheet)
+    s.svc = type("S", (), {"spreadsheets": lambda self: type("X", (), {
+        "values": lambda self: Values()})()})()
+    s.sid, s._last_write = "id", {}
+    assert s.write("Output", [["a"], ["b"]], force=True) is True

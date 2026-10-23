@@ -109,8 +109,13 @@ class Sheet:
         self._call(self.svc.spreadsheets().values().update(
             spreadsheetId=self.sid, range=f"'{tab}'!A1", valueInputOption="RAW",
             body={"values": rows}))
-        self._call(self.svc.spreadsheets().values().clear(
-            spreadsheetId=self.sid, range=f"'{tab}'!A{len(rows) + 1}:ZZ"))
+        try:
+            self._call(self.svc.spreadsheets().values().clear(
+                spreadsheetId=self.sid, range=f"'{tab}'!A{len(rows) + 1}:ZZ"))
+        except Exception as e:
+            # The tab ends exactly where the new rows end: nothing below to clear.
+            if "exceeds grid limits" not in str(e):
+                raise
         self._last_write[tab] = now
         return True
 
