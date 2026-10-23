@@ -39,6 +39,7 @@ IMAGE_MODELS = {
 
 # --- Business rules (Siddharth's decisions) ---
 BUSINESS_NAME = "Leapfour Media Pvt Ltd"
+BRAND_LABEL = "Ponly Cook"   # on every campaign (Siddharth, 23 Oct) + a category label
 DOMAIN_PREFIX = "https://ponly.com/"
 BUDGET_PER_ARTICLE_INR = 300
 MAX_CPC_INR = 2

@@ -18,6 +18,21 @@ def article_id(url):
     return hashlib.sha1(url.strip().encode()).hexdigest()[:12]
 
 
+def run_now(claude, reqs, workers=6):
+    """Send requests on the regular (non-batch) API in parallel; same result shape as
+    batch_results: {custom_id: (ok, data)}. Used for the pilot (Siddharth, 23 Oct)."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    def one(item):
+        cid, params = item
+        try:
+            return cid, (True, claude.sync_json(params))
+        except Exception as e:
+            return cid, (False, f"{type(e).__name__}: {str(e)[:200]}")
+    with ThreadPoolExecutor(workers) as ex:
+        return dict(ex.map(one, reqs))
+
+
 class Worker:
     def __init__(self, con, sheet, claude, rep, ads_factory):
         self.con, self.sheet, self.claude, self.rep = con, sheet, claude, rep
@@ -209,6 +224,21 @@ class Worker:
         return self.wave_passed(2) and self.chosen_model() is not None
 
     # ------------------------------------------------------------------ copy
+    def _apply_copy_results(self, res):
+        con = self.con
+        for cid, (ok, data) in res.items():
+            aid = cid.split("-")[1]
+            a = con.execute("SELECT * FROM articles WHERE id=?", (aid,)).fetchone()
+            problems = lint.check_copy(data, a["title"]) if ok else [f"API: {data}"]
+            if not problems:
+                db.update_article(con, aid, copy_json=json.dumps(data), status="copy_done",
+                                  error=None)
+            elif a["copy_attempts"] >= 2:
+                db.update_article(con, aid, status="skipped",
+                                  skip_reason="copy failed checks twice: " + "; ".join(problems)[:300])
+            else:
+                db.update_article(con, aid, status="themed", error=json.dumps(problems))
+
     def step_copy(self, w):
         con = self.con
         for j in db.open_jobs(con, "copy"):
@@ -216,19 +246,7 @@ class Worker:
                 continue
             if not self.claude.batch_ended(j["external_id"]):
                 return
-            res = self.claude.batch_results(j["external_id"])
-            for cid, (ok, data) in res.items():
-                aid = cid.split("-")[1]
-                a = con.execute("SELECT * FROM articles WHERE id=?", (aid,)).fetchone()
-                problems = lint.check_copy(data, a["title"]) if ok else [f"API: {data}"]
-                if not problems:
-                    db.update_article(con, aid, copy_json=json.dumps(data), status="copy_done",
-                                      error=None)
-                elif a["copy_attempts"] >= 2:
-                    db.update_article(con, aid, status="skipped",
-                                      skip_reason="copy failed checks twice: " + "; ".join(problems)[:300])
-                else:
-                    db.update_article(con, aid, status="themed", error=json.dumps(problems))
+            self._apply_copy_results(self.claude.batch_results(j["external_id"]))
             db.set_job(con, j["id"], state="done")
         todo = con.execute("SELECT * FROM articles WHERE wave=? AND status='themed'", (w,)).fetchall()
         if not todo:
@@ -238,12 +256,16 @@ class Worker:
             problems = json.loads(a["error"]) if a["error"] and a["error"].startswith("[") else None
             reqs.append((f"copy-{a['id']}-{a['copy_attempts'] + 1}",
                          llm.copy_params(a["title"], a["category"], a["theme"], problems)))
-        jid = db.new_job(con, "copy", w, state="creating")
-        bid = self.claude.create_batch(reqs)
-        db.set_job(con, jid, external_id=bid, state="running")
         for a in todo:
             db.update_article(con, a["id"], status="copy_pending",
                               copy_attempts=a["copy_attempts"] + 1)
+        if w == 1:   # pilot: regular API, results in minutes
+            self.log(f"wave 1: copy for {len(reqs)} articles (regular API)")
+            self._apply_copy_results(run_now(self.claude, reqs))
+            return
+        jid = db.new_job(con, "copy", w, state="creating")
+        bid = self.claude.create_batch(reqs)
+        db.set_job(con, jid, external_id=bid, state="running")
         self.log(f"wave {w}: copy batch {bid} ({len(reqs)} articles)")
 
     # ---------------------------------------------------------------- images
@@ -277,6 +299,30 @@ class Worker:
                 return
 
     # ----------------------------------------------------------- image check
+    def _apply_check_results(self, res):
+        con = self.con
+        for cid, (ok, data) in res.items():
+            aid = cid.split("-")[1]
+            a = con.execute("SELECT * FROM articles WHERE id=?", (aid,)).fetchone()
+            if not ok:
+                n = (a["check_api_errors"] or 0) + 1
+                if n >= 2:   # Siddharth: give up after 2 failed check attempts
+                    db.update_article(con, aid, status="skipped", check_api_errors=n,
+                                      skip_reason=f"image check could not run twice: {data}"[:300])
+                else:
+                    db.update_article(con, aid, status="image_done", check_api_errors=n,
+                                      error=f"check API: {data}")
+            elif data["pass"]:
+                db.update_article(con, aid, status="checked", error=None)
+            elif not a["check_failed_once"]:
+                self._delete_images(a)
+                db.update_article(con, aid, status="copy_done", check_failed_once=1,
+                                  error="image check: " + "; ".join(data["problems"])[:300])
+            else:
+                self._delete_images(a)
+                db.update_article(con, aid, status="skipped", skip_reason=(
+                    "image failed check twice: " + "; ".join(data["problems"]))[:300])
+
     def step_check(self, w):
         con = self.con
         for j in db.open_jobs(con, "check"):
@@ -284,30 +330,9 @@ class Worker:
                 continue
             if not self.claude.batch_ended(j["external_id"]):
                 return
-            res = self.claude.batch_results(j["external_id"])
-            for cid, (ok, data) in res.items():
-                aid = cid.split("-")[1]
-                a = con.execute("SELECT * FROM articles WHERE id=?", (aid,)).fetchone()
-                if not ok:
-                    n = (a["check_api_errors"] or 0) + 1
-                    if n >= 2:   # Siddharth: give up after 2 failed check attempts
-                        db.update_article(con, aid, status="skipped", check_api_errors=n,
-                                          skip_reason=f"image check could not run twice: {data}"[:300])
-                    else:
-                        db.update_article(con, aid, status="image_done", check_api_errors=n,
-                                          error=f"check API: {data}")
-                elif data["pass"]:
-                    db.update_article(con, aid, status="checked", error=None)
-                elif not a["check_failed_once"]:
-                    self._delete_images(a)
-                    db.update_article(con, aid, status="copy_done", check_failed_once=1,
-                                      error="image check: " + "; ".join(data["problems"])[:300])
-                else:
-                    self._delete_images(a)
-                    db.update_article(con, aid, status="skipped", skip_reason=(
-                        "image failed check twice: " + "; ".join(data["problems"]))[:300])
+            self._apply_check_results(self.claude.batch_results(j["external_id"]))
             db.set_job(con, j["id"], state="done")
-        # wait until this wave has no images still being made, then check in one batch
+        # wait until this wave has no images still being made, then check in one go
         if con.execute("SELECT 1 FROM articles WHERE wave=? AND status IN ('copy_done',"
                        "'image_pending','themed','copy_pending')", (w,)).fetchone():
             return
@@ -320,6 +345,12 @@ class Worker:
             with open(a["landscape_path"], "rb") as f1, open(a["square_path"], "rb") as f2:
                 reqs.append((f"chk-{a['id']}-{a['image_attempts']}",
                              llm.check_params(a["title"], f1.read(), f2.read())))
+        if w == 1:   # pilot: regular API, results in minutes
+            for cid, _ in reqs:
+                db.update_article(con, cid.split("-")[1], status="check_pending")
+            self.log(f"wave 1: image check for {len(reqs)} articles (regular API)")
+            self._apply_check_results(run_now(self.claude, reqs))
+            return
         for i in range(0, len(reqs), 250):   # keep each batch request body modest
             part = reqs[i:i + 250]
             jid = db.new_job(con, "check", w, state="creating")

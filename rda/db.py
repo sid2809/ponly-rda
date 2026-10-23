@@ -49,7 +49,9 @@ def connect(path=None):
     con.executescript(SCHEMA)
     for table, col, decl in (("campaigns", "error", "TEXT"), ("campaigns", "attempts", "INTEGER DEFAULT 0"),
                              ("adgroups", "error", "TEXT"), ("adgroups", "attempts", "INTEGER DEFAULT 0"),
-                             ("articles", "check_api_errors", "INTEGER DEFAULT 0")):
+                             ("articles", "check_api_errors", "INTEGER DEFAULT 0"),
+                             ("campaigns", "labels_done", "TEXT"),
+                             ("campaigns", "label_attempts", "INTEGER DEFAULT 0")):
         have = {r[1] for r in con.execute(f"PRAGMA table_info({table})")}
         if col not in have:
             con.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")

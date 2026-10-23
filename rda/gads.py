@@ -55,6 +55,42 @@ class Ads:
             rows.extend(batch.results)
         return rows
 
+    # ---------- labels ----------
+    def labels_for(self, c):
+        """'Ponly Cook' + category; ALCOHOL campaigns get 'ALCOHOL' + each category inside."""
+        if c["pool"] != "ALCOHOL":
+            return [config.BRAND_LABEL, c["pool"]]
+        cats = [r["category"] for r in self.con.execute(
+            "SELECT DISTINCT a.category FROM articles a JOIN adgroups g ON a.adgroup_key=g.key "
+            "WHERE g.campaign_key=? ORDER BY a.category", (c["key"],))]
+        return [config.BRAND_LABEL, "ALCOHOL"] + cats
+
+    def ensure_labels(self, names):
+        """Find or create account labels by name; remembered per account."""
+        known = db.kv_get(self.con, f"labels_{self.cid}", {})
+        need = sorted({n for n in names if n not in known})
+        if not need:
+            return known
+        quoted = ",".join("'" + n.replace("\\", "\\\\").replace("'", "\\'") + "'" for n in need)
+        for row in self.search(f"SELECT label.resource_name, label.name FROM label "
+                               f"WHERE label.name IN ({quoted}) AND label.status = 'ENABLED'",
+                               "labels"):
+            known[row.label.name] = row.label.resource_name
+        create = [n for n in need if n not in known]
+        if create:
+            ops = []
+            for n in create:
+                op = self.client.get_type("LabelOperation")
+                op.create.name = n
+                ops.append(op)
+            r = self.client.get_service("LabelService").mutate_labels(
+                customer_id=self.cid, operations=ops)
+            db.log_ops(self.con, len(ops), "labels")
+            for n, res in zip(create, r.results):
+                known[n] = res.resource_name
+        db.kv_set(self.con, f"labels_{self.cid}", known)
+        return known
+
     # ---------- operation builders ----------
     def ops_for_wave(self, wave, logos, temp_start=-1):
         """Build MutateOperations for every entity of this wave that has no resource yet.
@@ -70,6 +106,8 @@ class Ads:
         units = []
         camps = con.execute("SELECT * FROM campaigns WHERE wave=? AND status!='failed' ORDER BY key",
                             (wave,)).fetchall()
+        wanted = {} if wave == 0 else {c["key"]: self.labels_for(c) for c in camps}
+        label_res = self.ensure_labels([n for v in wanted.values() for n in v]) if wanted else {}
         for c in camps:
             ops, idx, nbytes = [], [], 0
             budget_res = c["budget_res"]
@@ -114,6 +152,16 @@ class Ads:
                     else:
                         cc.language.language_constant = value
                     ops.append(op); idx.append({"t": kind, "k": c["key"]})
+            done = json.loads(c["labels_done"] or "[]")
+            if (c["label_attempts"] or 0) < 3:
+                for name in wanted.get(c["key"], []):
+                    if name in done:
+                        continue
+                    op = self._op()
+                    cl = op.campaign_label_operation.create
+                    cl.campaign = camp_res
+                    cl.label = label_res[name]
+                    ops.append(op); idx.append({"t": "label", "k": c["key"], "l": name})
             ags = con.execute("SELECT * FROM adgroups WHERE campaign_key=? AND COALESCE(attempts,0)<3"
                               " ORDER BY nn", (c["key"],)).fetchall()
             for g in ags:
@@ -214,6 +262,11 @@ class Ads:
                                          "a.status='planned'", (k,)).fetchall():
                         db.update_article(con, a["id"], status="error",
                                           error=f"campaign not created: {msg}")
+            elif t == "label":
+                c = con.execute("SELECT label_attempts FROM campaigns WHERE key=?", (k,)).fetchone()
+                con.execute("UPDATE campaigns SET error=?, label_attempts=? WHERE key=?",
+                            (f"label '{entry.get('l')}': {error}"[:500],
+                             (c["label_attempts"] or 0) + 1, k))
             elif t in ("adgroup", "exclusion"):
                 g = con.execute("SELECT * FROM adgroups WHERE key=?", (k,)).fetchone()
                 counts = t == "adgroup" or (t == "exclusion" and g["adgroup_res"])
@@ -233,6 +286,10 @@ class Ads:
             con.execute(f"UPDATE {col[0]} SET {col[1]}=? WHERE key=?", (resource_name, k))
             if t == "campaign":
                 con.execute("UPDATE campaigns SET status='created' WHERE key=?", (k,))
+        elif t == "label":
+            c = con.execute("SELECT labels_done FROM campaigns WHERE key=?", (k,)).fetchone()
+            done = json.loads(c["labels_done"] or "[]") + [entry["l"]]
+            con.execute("UPDATE campaigns SET labels_done=? WHERE key=?", (json.dumps(done), k))
         elif t in ("assetL", "assetS"):
             db.update_article(con, k, **{("landscape_asset" if t == "assetL" else
                                           "square_asset"): resource_name})

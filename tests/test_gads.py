@@ -26,6 +26,10 @@ class StubBatch:
         self.jobs[resource_name]["ops"].extend(mutate_operations)
         return types.SimpleNamespace(next_sequence_token="t")
 
+    def mutate_labels(self, customer_id, operations):
+        return types.SimpleNamespace(results=[types.SimpleNamespace(
+            resource_name=f"customers/1/labels/{i}") for i, _ in enumerate(operations)])
+
     def run_batch_job(self, resource_name):
         self.jobs[resource_name]["status"] = "DONE"
 
@@ -59,6 +63,8 @@ def setup(tmp, fail_types=()):
     class TAds(Ads):
         def search(self, query, kind="search"):
             db.log_ops(self.con, 1, kind)
+            if "FROM label" in query:
+                return []
             res = query.split("'")[1]
             st = types.SimpleNamespace(name=stub.jobs[res]["status"])
             return [types.SimpleNamespace(batch_job=types.SimpleNamespace(status=st))]
@@ -97,6 +103,9 @@ def test_full_upload_no_duplicates():
         assert stub.created_counts["ad_group_ad_operation"] == 4
         assert stub.created_counts["asset_operation"] == 8
         assert stub.created_counts["ad_group_criterion_operation"] == 1  # 18-24 exclusion
+        assert stub.created_counts["campaign_label_operation"] == 2      # Ponly Cook + category
+        import json as _j
+        assert _j.loads(con.execute("SELECT labels_done FROM campaigns").fetchone()[0]) == ["Ponly Cook", "P"]
         assert con.execute("SELECT COUNT(*) n FROM articles WHERE status='uploaded'").fetchone()["n"] == 4
         assert ads.ops_for_wave(1, logos) == []
         # images deleted once both assets exist

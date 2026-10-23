@@ -142,6 +142,13 @@ def fake_ads(con):
             db.log_ops(self.con, 1, kind)
             return []
 
+        def ensure_labels(self, names):
+            known = db.kv_get(self.con, f"labels_{self.cid}", {})
+            for n in names:
+                known.setdefault(n, f"customers/{self.cid}/labels/{len(known) + 1}")
+            db.kv_set(self.con, f"labels_{self.cid}", known)
+            return known
+
         def upload_logos(self):
             return {"landscape": f"customers/{self.cid}/assets/1",
                     "square": f"customers/{self.cid}/assets/2"}
