@@ -20,7 +20,7 @@ Wave 3 starts after Wave 2 passes.
 |---|---|
 | `SHEET_ID` | ID from the Sheet URL (between `/d/` and `/edit`) |
 | `GOOGLE_SERVICE_ACCOUNT_JSON` | full JSON key text of the service account |
-| `GOOGLE_ADS_CUSTOMER_ID` | `REMOVED` |
+| `GOOGLE_ADS_CUSTOMER_ID` | your Google Ads account ID, no dashes |
 | `GOOGLE_ADS_LOGIN_CUSTOMER_ID` | manager (MCC) ID, only if access is through a manager |
 | `GOOGLE_ADS_DEVELOPER_TOKEN` | if you have one (Google's docs disagree on whether it is still needed) |
 | `GOOGLE_ADS_CLIENT_ID`, `GOOGLE_ADS_CLIENT_SECRET`, `GOOGLE_ADS_REFRESH_TOKEN` | OAuth login (same as n8n) |
