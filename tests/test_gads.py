@@ -141,6 +141,19 @@ class Stub:
         return NS(results=out, partial_failure_error=self._failure(bad, "DUPLICATE_NAME")
                   if bad else None)
 
+    def mutate_campaign_labels(self, request):
+        out, bad = [], []
+        for i, op in enumerate(request["operations"]):
+            name = next(n for n, _, r in self.labels if r == op.create.label)
+            if (op.create.campaign, name) in self.ent["clabel"]:
+                bad.append(i)                       # Google: already applied
+                out.append(NS(resource_name=""))
+                continue
+            self.ent["clabel"].append((op.create.campaign, name))
+            out.append(NS(resource_name=f"{op.create.campaign}~{i}"))
+        return NS(results=out, partial_failure_error=self._failure(
+            bad, "DUPLICATE_CAMPAIGN_LABEL") if bad else None)
+
     def mutate_campaign_budgets(self, request):
         out = []
         for op in request["operations"]:
@@ -581,3 +594,20 @@ def test_sync_adds_up_daily_rows():
         ads.sync("2026-10-24")
         r = con.execute("SELECT impressions, clicks, approval FROM articles WHERE id='a0'").fetchone()
         assert (r["impressions"], r["clicks"], r["approval"]) == (150, 3, "APPROVED")
+
+
+def test_model_label_added_to_existing_campaigns():
+    with tempfile.TemporaryDirectory() as tmp:
+        con, ads, stub, logos = setup(tmp)
+        drive(ads, logos)
+        db.kv_set(con, "uploaded_1", True)
+        con.execute("UPDATE campaigns SET image_model='nano-banana'")   # label added later
+        assert ads.add_missing_labels() == 1
+        res = con.execute("SELECT campaign_res, labels_done FROM campaigns").fetchone()
+        assert (res["campaign_res"], "Nano Banana") in stub.ent["clabel"]
+        assert "Nano Banana" in json.loads(res["labels_done"])
+        assert ads.add_missing_labels() == 0                      # nothing twice
+        # already applied in Google Ads but not recorded here -> recorded, not an error
+        con.execute("UPDATE campaigns SET labels_done=?", (json.dumps(["Ponly Cook", "P"]),))
+        assert ads.add_missing_labels() == 1
+        assert con.execute("SELECT label_attempts FROM campaigns").fetchone()[0] == 0

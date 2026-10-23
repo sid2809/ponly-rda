@@ -1089,6 +1089,8 @@ class Worker:
                     if name in ("upload", "enable") and not ads_ok:
                         continue
                     self.run_step(f"{name}:w{w}", fn, w)
+            if ads_ok:
+                self.run_step("labels", self.ads.add_missing_labels)
             self.run_step("sync", self.step_sync)
         finally:
             try:

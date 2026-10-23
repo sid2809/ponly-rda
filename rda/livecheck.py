@@ -111,7 +111,7 @@ def run(w):
         if not camps:
             return True, "no campaigns yet"
         from .gads import _chunks, _q
-        dup, mism = [], []
+        dup, mism, pending = [], [], []
         names = [c["name"] for c in camps]
         cnt = {}
         for part in _chunks(names):
@@ -160,7 +160,10 @@ def run(w):
                     if have.count(n) > 1]
             want = set(ads.wanted_labels(c))
             if want - set(have):
-                mism.append(f"{c['name']}: labels missing {sorted(want - set(have))}")
+                if (c["label_attempts"] or 0) < 3:     # the worker adds these on its next loop
+                    pending.append(f"{c['name']}: {sorted(want - set(have))}")
+                else:
+                    mism.append(f"{c['name']}: labels missing {sorted(want - set(have))}")
         dup += [f"ad group '{n}' x{len(v)}" for (r, n), v in ags.items() if len(v) > 1]
         stored = {g["adgroup_res"] for g in con.execute("SELECT adgroup_res FROM adgroups WHERE "
                                                         "adgroup_res IS NOT NULL")}
@@ -208,7 +211,9 @@ def run(w):
                 acnt[x.asset.name] = acnt.get(x.asset.name, 0) + 1
         dup += [f"image asset '{k}' x{v}" for k, v in acnt.items() if v > 1]
         summary = (f"{len(camps)} campaigns, {len(ags)} ad groups, {len(all_ads)} ads checked; "
-                   f"duplicates: {dup[:20] or 'none'}; mismatches: {mism[:20] or 'none'}")
+                   f"duplicates: {dup[:20] or 'none'}; mismatches: {mism[:20] or 'none'}; "
+                   f"labels still to be added by the worker: {len(pending)} campaigns "
+                   f"{pending[:3] if pending else ''}")
         return not dup and not mism, summary
 
     def enable_validate_only():

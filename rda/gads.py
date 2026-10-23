@@ -133,13 +133,66 @@ class Ads:
 
     # ---------- labels ----------
     def labels_for(self, c):
-        """'Ponly Cook' + category; ALCOHOL campaigns get 'ALCOHOL' + each category inside."""
+        """'Ponly Cook' + category (+ the image model); ALCOHOL campaigns get 'ALCOHOL' + each
+        category inside."""
+        model = [config.MODEL_LABELS[c["image_model"]]] if c["image_model"] in \
+            config.MODEL_LABELS else []
         if c["pool"] != "ALCOHOL":
-            return [config.BRAND_LABEL, c["pool"]]
+            return [config.BRAND_LABEL, c["pool"]] + model
         cats = [r["category"] for r in self.con.execute(
             "SELECT DISTINCT a.category FROM articles a JOIN adgroups g ON a.adgroup_key=g.key "
             "WHERE g.campaign_key=? ORDER BY a.category", (c["key"],))]
-        return [config.BRAND_LABEL, "ALCOHOL"] + cats
+        return [config.BRAND_LABEL, "ALCOHOL"] + cats + model
+
+    def add_missing_labels(self):
+        """Labels wanted on campaigns of waves already uploaded but not applied yet (e.g. a
+        label added later, like the image model). Never touches anything else."""
+        con = self.con
+        camps = [dict(c) for c in con.execute(
+            "SELECT * FROM campaigns WHERE campaign_res IS NOT NULL AND status IN "
+            "('created','enabled') AND COALESCE(label_attempts,0)<3")
+            if db.kv_get(con, f"uploaded_{c['wave']}")]
+        todo = []
+        for c in camps:
+            done = set(json.loads(c["labels_done"] or "[]"))
+            todo += [(c, n) for n in self.wanted_labels(c) if n not in done]
+        if not todo:
+            return 0
+        known = self.ensure_labels([n for _, n in todo])
+        todo = [(c, n) for c, n in todo if n in known]
+        if not todo:
+            return 0
+        ops = []
+        for c, n in todo:
+            op = self.client.get_type("CampaignLabelOperation")
+            op.create.campaign = c["campaign_res"]
+            op.create.label = known[n]
+            ops.append(op)
+        r = self.client.get_service("CampaignLabelService").mutate_campaign_labels(
+            request={"customer_id": self.cid, "operations": ops, "partial_failure": True})
+        db.log_ops(con, len(ops), "labels")
+        failed = self.partial_failures(r)
+        added = 0
+        with db.tx(con):
+            for i, (c, n) in enumerate(todo):
+                row = con.execute("SELECT labels_done, label_attempts FROM campaigns WHERE key=?",
+                                  (c["key"],)).fetchone()
+                done = json.loads(row["labels_done"] or "[]")
+                err = failed.get(i) or failed.get(None)
+                ok = not err and i < len(r.results) and r.results[i].resource_name
+                if ok or (err and ("DUPLICATE" in err.upper() or "ALREADY" in err.upper())):
+                    if n not in done:
+                        done.append(n)
+                    con.execute("UPDATE campaigns SET labels_done=? WHERE key=?",
+                                (json.dumps(done), c["key"]))
+                    added += 1
+                    log(f"label '{n}' added to campaign {c['name']}")
+                else:
+                    con.execute("UPDATE campaigns SET label_attempts=?, error=? WHERE key=?",
+                                ((row["label_attempts"] or 0) + 1,
+                                 f"label '{n}': {err}"[:500], c["key"]))
+                    log(f"label '{n}' FAILED on campaign {c['name']}: {short(err, 300)}")
+        return added
 
     def label_problems(self):
         return db.kv_get(self.con, f"label_problems_{self.cid}", {})
