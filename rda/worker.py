@@ -453,6 +453,7 @@ class Worker:
                 ["Mode", "DRY RUN (nothing real)" if config.DRY_RUN else "live"],
                 ["Preflight", json.dumps(db.kv_get(con, "preflight", {}))[:45000]],
                 ["Preflight passed", bool(db.kv_get(con, "preflight_passed"))],
+                ["Connections (checked at startup)", json.dumps(db.kv_get(con, "connections", {}))],
                 ["Pilot categories", "; ".join(db.kv_get(con, "pilot_categories", []))]]
         for k in sorted(counts):
             rows.append([f"Articles: {k}", counts[k]])
@@ -523,6 +524,38 @@ def build():
     return Worker(con, sheet, llm.Claude(), images.ReplicateClient(), Ads)
 
 
+def check_connections(w):
+    """Harmless read from each service at startup: creates nothing, costs nothing."""
+    res = {}
+
+    def run(name, fn):
+        try:
+            res[name] = "OK: " + fn()
+        except Exception as e:
+            res[name] = f"FAIL: {type(e).__name__}: {str(e)[:300]}"
+        w.log(f"connection {name}: {res[name]}")
+
+    def ads():
+        r = w.ads.search("SELECT customer.id, customer.descriptive_name, "
+                         "customer.currency_code FROM customer LIMIT 1", "check")
+        c = r[0].customer
+        return f"account {c.id} '{c.descriptive_name}', currency {c.currency_code}"
+
+    def claude():
+        m = w.claude.c.models.retrieve(config.HAIKU_MODEL)
+        return f"{m.id} available"
+
+    def rep():
+        for k, m in config.IMAGE_MODELS.items():
+            w.rep.schema_inputs(m["ref"])
+        return "minimax and nano-banana model info read"
+
+    run("Google Ads", ads)
+    run("Anthropic", claude)
+    run("Replicate", rep)
+    return res
+
+
 REQUIRED_VARS = ["SHEET_ID", "GOOGLE_SERVICE_ACCOUNT_JSON", "GOOGLE_ADS_CUSTOMER_ID",
                  "ANTHROPIC_API_KEY", "REPLICATE_API_TOKEN"]
 
@@ -543,6 +576,7 @@ def main():
     print("All Railway variables present. Connecting to the Sheet...", flush=True)
     w = build()
     w.log("Worker started. Sheet tabs ready.")
+    db.kv_set(w.con, "connections", check_connections(w))
     was_paused = None
     while True:
         paused = w.s_bool("Pause") if w.settings else None
