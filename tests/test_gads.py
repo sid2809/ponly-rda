@@ -134,3 +134,27 @@ def test_quota_respected():
         con, ads, stub, logos = setup(tmp)
         assert ads.run_upload(1, logos, 10) == 0   # campaign unit (~20 ops) does not fit
         assert stub.n == 0
+
+
+def test_campaign_failure_reported_and_stops_after_3():
+    with tempfile.TemporaryDirectory() as tmp:
+        con, ads, stub, logos = setup(tmp)
+        orig = stub.list_batch_job_results
+
+        def always_fail_campaign(resource_name, page_size):
+            # campaign fails; everything that references it fails too (as in Google Ads)
+            out = []
+            for r in orig(resource_name, page_size):
+                op = stub.jobs[resource_name]["ops"][r.operation_index]
+                if op._pb.WhichOneof("operation") not in ("asset_operation",
+                                                           "campaign_budget_operation"):
+                    r.status.code, r.status.message = 3, "RESOURCE_LIMIT: too many campaigns"
+                out.append(r)
+            return out
+        stub.list_batch_job_results = always_fail_campaign
+        drive(ads, logos, rounds=12)
+        c = con.execute("SELECT * FROM campaigns WHERE key='c1'").fetchone()
+        assert c["status"] == "failed" and c["attempts"] == 3 and "campaign" in c["error"]
+        errs = [r["error"] for r in con.execute("SELECT error FROM articles WHERE status='error'")]
+        assert len(errs) == 4 and all("campaign not created" in e for e in errs)
+        assert ads.ops_for_wave(1, logos) == []   # no endless retries

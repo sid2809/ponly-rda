@@ -432,12 +432,13 @@ class Worker:
                         a["impressions"] or 0, a["clicks"] or 0, round(a["regen_cost"] or 0, 3)])
         self.sheet.write("Output", out, force)
         cm = [["Campaign ID", "Campaign name", "Ad group ID", "Ad group name", "Wave",
-               "Image model", "Status"]]
+               "Image model", "Campaign status", "Error"]]
         for g in ag.values():
             c = camp[g["campaign_key"]]
             cm.append([(c["campaign_res"] or "").split("/")[-1], c["name"],
                        (g["adgroup_res"] or "").split("/")[-1], g["name"], c["wave"],
-                       c["image_model"] or "", c["status"]])
+                       c["image_model"] or "", c["status"],
+                       c.get("error") or g.get("error") or ""])
         self.sheet.write("Campaign map", cm, force)
         self.sheet.write("Summary", self.summary_rows(), force)
 
@@ -457,8 +458,14 @@ class Worker:
                 ["Pilot categories", "; ".join(db.kv_get(con, "pilot_categories", []))]]
         for k in sorted(counts):
             rows.append([f"Articles: {k}", counts[k]])
+        failed = con.execute("SELECT name, error FROM campaigns WHERE status='failed'").fetchall()
         rows += [["Campaigns created", con.execute(
                      "SELECT COUNT(*) n FROM campaigns WHERE campaign_res IS NOT NULL").fetchone()["n"]],
+                 ["Campaigns FAILED (see Campaign map > Error)", len(failed)],
+                 ["Failed campaigns", "; ".join(f"{r['name']}: {r['error']}" for r in failed)[:45000]],
+                 ["Campaigns / ad groups with a pending error",
+                  con.execute("SELECT COUNT(*) n FROM campaigns WHERE error IS NOT NULL AND "
+                              "status!='failed'").fetchone()["n"]],
                  ["Images made (by model)", json.dumps(preds)],
                  ["Replicate spend (estimate, confirm in billing)", round(img_usd, 2)],
                  ["Google Ads API operations, last 24 h", db.ops_last_24h(con)],

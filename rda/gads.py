@@ -68,7 +68,8 @@ class Ads:
             return v
 
         units = []
-        camps = con.execute("SELECT * FROM campaigns WHERE wave=? ORDER BY key", (wave,)).fetchall()
+        camps = con.execute("SELECT * FROM campaigns WHERE wave=? AND status!='failed' ORDER BY key",
+                            (wave,)).fetchall()
         for c in camps:
             ops, idx, nbytes = [], [], 0
             budget_res = c["budget_res"]
@@ -113,8 +114,8 @@ class Ads:
                     else:
                         cc.language.language_constant = value
                     ops.append(op); idx.append({"t": kind, "k": c["key"]})
-            ags = con.execute("SELECT * FROM adgroups WHERE campaign_key=? ORDER BY nn",
-                              (c["key"],)).fetchall()
+            ags = con.execute("SELECT * FROM adgroups WHERE campaign_key=? AND COALESCE(attempts,0)<3"
+                              " ORDER BY nn", (c["key"],)).fetchall()
             for g in ags:
                 ag_res = g["adgroup_res"]
                 if not ag_res:
@@ -189,13 +190,40 @@ class Ads:
     def apply_result(self, entry, resource_name, error):
         con, k, t = self.con, entry["k"], entry["t"]
         if error:
+            msg = f"{t}: {error}"[:500]
             if t in ("ad", "assetL", "assetS"):
-                a = con.execute("SELECT ad_attempts FROM articles WHERE id=?", (k,)).fetchone()
+                a = con.execute("SELECT ad_attempts, status FROM articles WHERE id=?",
+                                (k,)).fetchone()
+                if a["status"] == "error":   # already explained by its campaign/ad group
+                    return
                 n = (a["ad_attempts"] or 0) + 1
-                fields = {"ad_attempts": n, "error": f"upload {t}: {error}"[:500]}
+                fields = {"ad_attempts": n, "error": f"upload {msg}"}
                 if n >= 3:
                     fields.update(status="error")
                 db.update_article(con, k, **fields)
+            elif t in ("budget", "campaign", "geo", "lang"):
+                c = con.execute("SELECT * FROM campaigns WHERE key=?", (k,)).fetchone()
+                # count one attempt per job: on the campaign op, or on geo/lang once it exists
+                counts = t == "campaign" or (t in ("geo", "lang") and c["campaign_res"])
+                n = (c["attempts"] or 0) + (1 if counts else 0)
+                con.execute("UPDATE campaigns SET error=?, attempts=? WHERE key=?", (msg, n, k))
+                if n >= 3:
+                    con.execute("UPDATE campaigns SET status='failed' WHERE key=?", (k,))
+                    for a in con.execute("SELECT a.id FROM articles a JOIN adgroups g ON "
+                                         "a.adgroup_key=g.key WHERE g.campaign_key=? AND "
+                                         "a.status='planned'", (k,)).fetchall():
+                        db.update_article(con, a["id"], status="error",
+                                          error=f"campaign not created: {msg}")
+            elif t in ("adgroup", "exclusion"):
+                g = con.execute("SELECT * FROM adgroups WHERE key=?", (k,)).fetchone()
+                counts = t == "adgroup" or (t == "exclusion" and g["adgroup_res"])
+                n = (g["attempts"] or 0) + (1 if counts else 0)
+                con.execute("UPDATE adgroups SET error=?, attempts=? WHERE key=?", (msg, n, k))
+                if n >= 3:
+                    for a in con.execute("SELECT id FROM articles WHERE adgroup_key=? AND "
+                                         "status='planned'", (k,)).fetchall():
+                        db.update_article(con, a["id"], status="error",
+                                          error=f"ad group not created: {msg}")
             return
         col = {"budget": ("campaigns", "budget_res"), "campaign": ("campaigns", "campaign_res"),
                "geo": ("campaigns", "geo_res"), "lang": ("campaigns", "lang_res"),
