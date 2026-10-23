@@ -47,3 +47,13 @@ Verified independently: v26 batch_job_error.REQUEST_TOO_LARGE = 10,484,504 bytes
 | R14 | **P11 order:** collision check runs after reconcile, before each job, only for campaigns without `campaign_res`; it also checks budget names (`"<name> | budget"`). | B3 |
 | R15 | **P10 details:** partial-failure results are mapped by `GoogleAdsFailure.errors[].location.field_path_elements[0].index` decoded from `partial_failure_error.details`; empty `resource_name` is never stored. Labels: fetch all `label.name`/`label.status`, compare case-insensitively in Python; a match that is REMOVED → reported (`CANNOT_APPLY_INACTIVE_LABEL`), not applied or recreated. | B4 |
 | R16 | **Error decoding:** each `status.details` item decoded with `client.get_type("GoogleAdsFailure")` + `type(f).deserialize(detail.value)`; fallback `status.message`. | B5 |
+
+## Round 3 corrections
+
+| # | Correction | From |
+|---|---|---|
+| R17 | **Collision check never blocks our own entities.** A budget-name match counts as a collision only if its `campaign_budget.resource_name` differs from our stored `budget_res` (check skipped when `budget_res` is set); a campaign-name match counts only if its resource differs from one we stored or adopted by reconcile. A transient campaign failure therefore still gets its 3 retries. | B-R14 |
+| R18 | R16 refinement: decode only `status.details` items whose `type_url` ends in `GoogleAdsFailure`; anything else falls back to `status.message`. | B-R16 |
+| R19 | R5 safety: adopt a found batch only if exactly one matches (else report, leave job); after it ends, apply only if its custom_ids match the job's saved article IDs; any listed article missing from results is reverted. Compare `created_at` (tz-aware) with the row time in UTC with a few seconds' tolerance. The doubled-max_tokens retry flag is stored per article (survives restarts). | A-R5, A-R1 |
+| R20 | R11 lease: holder token is a per-process `uuid4()` (not the PID); heartbeat updated between steps and between `run_now` chunks; a lease counts as stale only after 15 min. | C-R11 |
+| R21 | R5 adoption also requires `created_at` within ~2 min after the job row's timestamp (on top of R19). | C-R5 |
