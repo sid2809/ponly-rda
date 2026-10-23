@@ -90,6 +90,12 @@ def kv_set(con, k, v):
 
 
 def update_article(con, aid, **fields):
+    if fields.get("status") in ("skipped", "error"):
+        from .log import log, short
+        r = con.execute("SELECT title, wave FROM articles WHERE id=?", (aid,)).fetchone()
+        why = fields.get("skip_reason") or fields.get("error") or ""
+        log(f"article {fields['status'].upper()}: {aid} '{short(r['title'] if r else '', 60)}' "
+            f"(wave {r['wave'] if r else '?'}): {short(why, 300)}")
     fields["updated"] = time.time()
     cols = ", ".join(f"{k}=?" for k in fields)
     con.execute(f"UPDATE articles SET {cols} WHERE id=?", (*fields.values(), aid))

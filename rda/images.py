@@ -7,6 +7,7 @@ import requests
 from PIL import Image
 
 from . import config, db
+from .log import log, short
 
 LANDSCAPE = (1200, 628)
 SQUARE = (720, 720)
@@ -97,6 +98,8 @@ def start_prediction(con, client, article, model_key, extra_rule=""):
                 (pid, article["id"], model_key, "starting", time.time()))
     db.update_article(con, article["id"], status="image_pending", image_model=model_key,
                       image_attempts=article["image_attempts"] + 1)
+    log(f"image started: {article['id']} '{short(article['title'], 60)}' model={model_key} "
+        f"attempt={article['image_attempts'] + 1} prediction={pid}")
     return pid
 
 
@@ -115,6 +118,8 @@ def _fail_prediction(con, p, reason):
     else:
         db.update_article(con, p["article_id"], status="copy_done",
                           error=f"image failed, will retry: {reason}"[:300])
+        log(f"image failed (will retry): {p['article_id']} prediction={p['id']}: "
+            f"{short(reason, 200)}")
 
 
 def poll_predictions(con, client):
@@ -127,14 +132,16 @@ def poll_predictions(con, client):
         if age > PREDICTION_TIMEOUT_S:
             try:
                 client.cancel(p["id"])
-            except Exception:
-                pass
+                log(f"image cancelled (no result after {int(age // 60)} min): prediction={p['id']}")
+            except Exception as e:
+                log(f"image cancel failed: prediction={p['id']}: {type(e).__name__}: {short(e)}")
             _fail_prediction(con, p, f"no result after {int(age // 60)} min")
             continue
         try:
             status, url, err = client.get(p["id"])
         except Exception as e:      # network / lost prediction: the timeout above handles it
-            print("replicate get error", p["id"], type(e).__name__, flush=True)
+            log(f"image status could not be read (will retry): prediction={p['id']}: "
+                f"{type(e).__name__}: {short(e)}")
             continue
         if status == "succeeded":
             if not url:
@@ -147,6 +154,7 @@ def poll_predictions(con, client):
                 _fail_prediction(con, p, f"bad image: {type(e).__name__}: {e}")
                 continue
             con.execute("UPDATE predictions SET state='done' WHERE id=?", (p["id"],))
+            log(f"image done: {p['article_id']} model={p['model']} prediction={p['id']}")
             # new image: any Google Ads image asset stored for an older image must not be used
             db.update_article(con, p["article_id"], status="image_done", landscape_path=lp,
                               square_path=sp, error=None, landscape_asset=None,

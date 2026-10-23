@@ -559,3 +559,25 @@ def test_remove_campaigns_real_signature_and_partial_failure():
         stub.enable_fail = {c["campaign_res"]}
         errs, _ = ads.remove_campaigns([c])
         assert "cannot remove" in errs["c1"]
+
+
+def test_sync_adds_up_daily_rows():
+    with tempfile.TemporaryDirectory() as tmp:
+        con, ads, stub, logos = setup(tmp)
+        drive(ads, logos)
+        ad = con.execute("SELECT ad_resource FROM articles WHERE id='a0'").fetchone()[0]
+
+        def search(q, kind="search"):
+            if "time_zone" in q:
+                return [NS(customer=NS(time_zone="Asia/Kolkata"))]
+            if "metrics" in q:          # one row per day
+                return [NS(ad_group_ad=NS(resource_name=ad), metrics=NS(impressions=100, clicks=2)),
+                        NS(ad_group_ad=NS(resource_name=ad), metrics=NS(impressions=50, clicks=1))]
+            cs = NS(enable_asset_enhancements=False, enable_autogen_video=False)
+            return [NS(ad_group_ad=NS(resource_name=ad, policy_summary=NS(
+                approval_status=NS(name="APPROVED"), policy_topic_entries=[]),
+                ad=NS(responsive_display_ad=NS(control_spec=cs))))]
+        ads.search = search
+        ads.sync("2026-10-24")
+        r = con.execute("SELECT impressions, clicks, approval FROM articles WHERE id='a0'").fetchone()
+        assert (r["impressions"], r["clicks"], r["approval"]) == (150, 3, "APPROVED")

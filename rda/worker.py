@@ -19,6 +19,7 @@ import uuid
 
 from . import alcohol, config, db, images, lint, llm, split
 from .gads import QuotaExhausted
+from .log import log as _log, short
 from .sheet import OUTPUT_HEADER
 
 TERMINAL = ("planned", "uploaded", "skipped", "error")
@@ -85,7 +86,30 @@ class Worker:
         return self._ads
 
     def log(self, msg):
-        print(time.strftime("%Y-%m-%d %H:%M:%S"), msg, flush=True)
+        _log(msg)
+
+    def _log_outcome(self, kind, wave, ids):
+        """One summary line per finished Claude job: where its articles ended up."""
+        if not ids:
+            return
+        q = ",".join("?" * len(ids))
+        st = {}
+        for r in self.con.execute(f"SELECT status, COUNT(*) n FROM articles WHERE id IN ({q}) "
+                                  f"GROUP BY status", ids):
+            st[r["status"]] = r["n"]
+        extra = ""
+        if kind == "alcohol":
+            r = self.con.execute(f"SELECT SUM(alcohol=1) a, SUM(alcohol=0) f FROM articles WHERE "
+                                 f"id IN ({q}) AND status='tagged'", ids).fetchone()
+            extra = f"; alcohol {r['a'] or 0}, food {r['f'] or 0}"
+        meaning = {"copy_done": "passed", "themed": "retry", "checked": "passed",
+                   "image_done": "retry check", "copy_done@check": "new image",
+                   "url_ok": "retry", "tagged": "tagged", "skipped": "skipped"}
+        parts = []
+        for s, n in sorted(st.items()):
+            label = meaning.get(f"{s}@{kind}", meaning.get(s, s))
+            parts.append(f"{label} {n}")
+        self.log(f"{kind} results (wave {wave}): {len(ids)} articles -> {', '.join(parts)}{extra}")
 
     # ------------------------------------------------------------ settings
     def s_bool(self, key):
@@ -232,6 +256,7 @@ class Worker:
             apply_fn(res)
             self._revert_unanswered(kind, ids, res)
             db.set_job(self.con, jid, state="done")
+        self._log_outcome(kind, wave, ids)
 
     def _revert_unanswered(self, kind, ids, res):
         answered = {cid_article(c) for c in res}
@@ -260,6 +285,7 @@ class Worker:
             if payload.get("ids"):
                 self._revert_unanswered(kind, payload["ids"], res)
             db.set_job(self.con, j["id"], state="done")
+        self._log_outcome(kind, j["wave"], payload.get("ids") or [cid_article(c) for c in res])
         errors = sum(1 for k, _ in res.values() if k != "ok")
         if errors:
             db.kv_set(self.con, "batch_errors_total",
@@ -326,6 +352,7 @@ class Worker:
     def _api_error(self, kind, a, msg):
         """R1: API/transport errors revert without a content attempt, but are capped."""
         con, aid = self.con, a["id"]
+        self.log(f"API error ({kind}), not counted as a failed check: {aid}: {short(msg, 200)}")
         if kind == "check":
             n = (a["check_api_errors"] or 0) + 1
             if n >= CHECK_API_CAP:
@@ -356,6 +383,7 @@ class Worker:
         bit = BIG[kind]
         if (a["big_tokens"] or 0) & bit:
             return False
+        self.log(f"answer cut off ({kind}): {a['id']}; retrying once with a larger limit")
         fields = {"big_tokens": (a["big_tokens"] or 0) | bit, "status": PENDING_OF[kind][1]}
         if kind == "copy":
             fields["copy_attempts"] = max(0, (a["copy_attempts"] or 0) - 1)
@@ -492,6 +520,8 @@ class Worker:
                     fields["note"] = "theme defaulted (Haiku did not assign one)"
                 db.update_article(con, r["id"], **fields)
             con.execute("INSERT OR REPLACE INTO themes VALUES(?,?)", (pool, json.dumps(themes)))
+        self.log(f"themes: {pool} done: {len(items)} articles in {len(themes)} themes, "
+                 f"{len(dset)} defaulted")
 
     # ----------------------------------------------------------------- waves
     def step_assign_waves(self):
@@ -617,6 +647,8 @@ class Worker:
                                   skip_reason="copy failed checks twice: " + "; ".join(problems)[:300])
             else:
                 db.update_article(con, a["id"], status="themed", error=json.dumps(problems))
+                self.log(f"copy failed checks (will retry): {a['id']} '{short(a['title'], 60)}': "
+                         f"{short('; '.join(problems), 300)}")
 
     def step_copy(self, w):
         con = self.con
@@ -655,6 +687,20 @@ class Worker:
             return
         todo = con.execute("SELECT * FROM articles WHERE wave=? AND status='copy_done' LIMIT ?",
                            (w, room)).fetchall()
+        counts = {"reused": 0, "started": 0}
+        try:
+            self._image_loop(w, todo, counts)
+        finally:
+            if counts["reused"] or counts["started"]:
+                left = con.execute("SELECT COUNT(*) FROM articles WHERE wave=? AND "
+                                   "status='copy_done'", (w,)).fetchone()[0]
+                busy = con.execute("SELECT COUNT(*) FROM predictions WHERE state NOT IN "
+                                   "('done','failed')").fetchone()[0]
+                self.log(f"images (wave {w}): {counts['reused']} reused, {counts['started']} "
+                         f"started this loop; {busy} being made; {left} waiting")
+
+    def _image_loop(self, w, todo, counts):
+        con = self.con
         began = time.time()
         for a in todo:
             model = a["image_model"] if w == 1 else self.chosen_model()
@@ -669,6 +715,8 @@ class Worker:
                     and os.path.exists(a["landscape_path"]) and os.path.exists(a["square_path"])):
                 db.update_article(con, a["id"], status="image_done",
                                   note="image reused from the first pilot run (no new cost)")
+                self.log(f"image reused (no new cost): {a['id']} '{short(a['title'], 60)}'")
+                counts["reused"] += 1
                 continue
             # 20-30 s between requests (Siddharth); the rest waits for the next loop
             wait = (db.kv_get(con, "last_image_request", 0)
@@ -686,6 +734,7 @@ class Worker:
                 images.start_prediction(con, self.rep, a, model, extra)
             finally:
                 db.kv_set(con, "last_image_request", time.time())
+            counts["started"] += 1
             if regen:   # regeneration: record its cost (only once it was really started)
                 db.update_article(con, a["id"], regen_cost=(a["regen_cost"] or 0) +
                                   config.IMAGE_MODELS[model]["est_usd"])
@@ -711,6 +760,8 @@ class Worker:
             if verdict:
                 db.update_article(con, a["id"], status="checked", error=None)
             elif not a["check_failed_once"]:
+                self.log(f"image check FAILED (a new image will be made): {a['id']} "
+                         f"'{short(a['title'], 60)}': {short('; '.join(problems), 300)}")
                 self._delete_images(a)
                 if (a["note"] or "").startswith("image reused"):
                     db.update_article(con, a["id"], note=None)   # a new image will be made
@@ -797,7 +848,9 @@ class Worker:
                     for a in g["articles"]:
                         db.update_article(con, a["id"], adgroup_key=gkey, status="planned")
             db.kv_set(con, f"planned_{w}", True)
-        self.log(f"wave {w}: campaigns planned")
+        self.log(f"wave {w}: campaigns planned: {len(plan)} campaigns, "
+                 f"{sum(len(c['adgroups']) for c in plan)} ad groups, "
+                 f"{sum(len(c['articles']) for c in plan)} articles")
 
     # ---------------------------------------------------------------- upload
     def step_upload(self, w):
@@ -979,7 +1032,14 @@ class Worker:
         try:
             if hasattr(self.sheet, "ensure_tabs"):
                 self.sheet.ensure_tabs()   # recreates any deleted tab (Pause starts ticked)
-            self.settings = self.sheet.read_settings()
+            new = self.sheet.read_settings()
+            old = getattr(self, "_last_settings", None)
+            if old is not None:
+                for k in sorted(set(old) | set(new)):
+                    if str(old.get(k)) != str(new.get(k)):
+                        self.log(f"Settings changed: '{k}': {old.get(k)!r} -> {new.get(k)!r}")
+            self._last_settings = dict(new)
+            self.settings = new
         except Exception as e:
             self.settings = None           # R7: nothing runs without readable Settings
             errs = db.kv_get(self.con, "step_errors", {})

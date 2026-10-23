@@ -8,6 +8,7 @@ import tempfile
 import time
 
 from . import config, db
+from .log import log, short
 
 API_VERSION = "v26"
 MAX_ASSET_BYTES = 8_000_000          # one op must fit in a 9 MB add request (P8)
@@ -185,6 +186,12 @@ class Ads:
                     problems[n] = f"label could not be created: {failed.get(i) or failed.get(None)}"
                 else:
                     known[n] = res.resource_name
+                    log(f"label created: '{n}'")
+        for n in need:
+            if n in problems:
+                log(f"label problem (not applied): '{n}': {problems[n]}")
+            elif n in known and n not in create:
+                log(f"label found in account and reused: '{n}'")
         db.kv_set(self.con, f"labels_{self.cid}", known)
         db.kv_set(self.con, f"label_problems_{self.cid}", problems)
         return known
@@ -500,10 +507,12 @@ class Ads:
                     self.fail_campaign(r["key"], "a campaign with this name already exists in "
                                                  "the account (not created by this run)")
                     blocked += 1
+                    log(f"campaign BLOCKED (name already in account): {name}")
                 elif bres and not r["budget_res"]:
                     self.fail_campaign(r["key"], "a budget named '<campaign> | budget' already "
                                                  "exists in the account (not created by this run)")
                     blocked += 1
+                    log(f"campaign BLOCKED (budget name already in account): {name}")
         return blocked
 
     # ---------- batch job (resumable) ----------
@@ -520,6 +529,7 @@ class Ads:
                 return -1                     # waiting before reconcile: build nothing yet
             self.reconcile(wave)
             con.execute("DELETE FROM kv WHERE k=?", (f"reconcile_due_{wave}",))
+            log(f"wave {wave}: account search done; existing items recorded, rebuild continues")
             return -1
         if not self.has_work(wave) or quota_left < 50:
             return 0
@@ -563,6 +573,11 @@ class Ads:
         svc.run_batch_job(resource_name=res)
         db.log_ops(con, 1, "batch_run")
         db.set_job(con, jid, state="running")
+        kinds = {}
+        for e in index:
+            kinds[e["t"]] = kinds.get(e["t"], 0) + 1
+        log(f"Google Ads job {jid} ({res.split('/')[-1]}) started for wave {wave}: "
+            f"{len(chosen_ops)} operations {kinds}")
         return len(chosen_ops)
 
     def _fail_count(self, job):
@@ -580,11 +595,16 @@ class Ads:
         rows = self.search(f"SELECT batch_job.status FROM batch_job "
                            f"WHERE batch_job.resource_name = '{res}'", "batch_poll")
         if not rows:
-            if self._fail_count(job) >= LOST_TRIES:
+            n = self._fail_count(job)
+            log(f"Google Ads job {job['id']}: not found ({n}/{LOST_TRIES})")
+            if n >= LOST_TRIES:
                 self._lost(job, "batch job not found")
             return
         status = rows[0].batch_job.status.name
         age = time.time() - (job["created"] or time.time())
+        if db.kv_get(con, f"job_status_{job['id']}") != status:
+            db.kv_set(con, f"job_status_{job['id']}", status)
+            log(f"Google Ads job {job['id']}: {status}")
         if status == "PENDING":
             if job["state"] in ("adding", "creating"):
                 # never asked to run -> nothing was created; Google deletes it after 7 days
@@ -622,7 +642,7 @@ class Ads:
             db.log_ops(con, 1, "batch_results")
             msg = f"{type(e).__name__}: {e}"[:400]
             db.kv_set(con, f"resume_error_{job['id']}", msg)
-            print(f"batch job {res}: results could not be listed: {msg}", flush=True)
+            log(f"Google Ads job {job['id']}: results could not be listed: {msg}")
             if self._fail_count(job) >= LOST_TRIES:
                 self._lost(job, "results could not be listed")
             return
@@ -633,12 +653,23 @@ class Ads:
                 if 0 <= op_index < len(index):
                     self.apply_result(index[op_index], name, err if code else None, counted)
             db.set_job(con, job["id"], state="done")
+        ok, bad = {}, {}
+        for op_index, code, err, name in results:
+            t = index[op_index]["t"] if 0 <= op_index < len(index) else "?"
+            (bad if code else ok)[t] = (bad if code else ok).get(t, 0) + 1
+        log(f"Google Ads job {job['id']} done: {len(results)} results for {len(index)} "
+            f"operations; created {ok}; errors {bad or 'none'}")
+        for op_index, code, err, name in [r for r in results if r[1]][:50]:
+            e = index[op_index] if 0 <= op_index < len(index) else {}
+            log(f"Google Ads error: {e.get('t')} {e.get('k')}: {short(err, 300)}")
 
     def _lost(self, job, why):
         """Reconcile only after a delay: right after a job, Google's search may not show
         everything yet, and adopting too early would let the rebuild create duplicates."""
         db.set_job(self.con, job["id"], state="lost")
         db.kv_set(self.con, f"lost_job_{job['id']}", why)
+        log(f"Google Ads job {job['id']} LOST ({why}); account search in "
+            f"{RECONCILE_DELAY_S // 60} min before anything is rebuilt")
         db.kv_set(self.con, f"reconcile_due_{job['wave']}", time.time() + RECONCILE_DELAY_S)
 
     # ---------- reconcile by search (R13) ----------
@@ -705,6 +736,8 @@ class Ads:
             for x in self.search(f"SELECT asset.resource_name, asset.name FROM asset WHERE "
                                  f"asset.name IN ({q})", "reconcile"):
                 found["asset"][x.asset.name] = x.asset.resource_name
+        db.kv_set(con, f"reconciled_{wave}", {k: len(v) for k, v in found.items()})
+        log(f"wave {wave}: account search found {db.kv_get(con, f'reconciled_{wave}')}")
         with db.tx(con):
             for c in camps:
                 b = found["budget"].get(f"{c['name']} | budget")
@@ -794,6 +827,7 @@ class Ads:
         r = svc.mutate_assets(customer_id=self.cid, operations=ops)
         db.log_ops(self.con, 2, "logos")
         logos = {"landscape": r.results[0].resource_name, "square": r.results[1].resource_name}
+        log(f"logos uploaded: {logos}")
         db.kv_set(self.con, f"logos_{self.cid}", logos)
         return logos
 
@@ -818,6 +852,11 @@ class Ads:
                                                  "partial_failure": True})
             db.log_ops(con, len(ops), "enable")
             failed = self.partial_failures(resp)
+            for j, r in enumerate(chunk):
+                if j in failed or None in failed:
+                    log(f"enable FAILED: campaign {r['key']}: {short(failed.get(j) or failed.get(None), 300)}")
+                else:
+                    log(f"enabled: campaign {r['key']} ({r['campaign_res'].split('/')[-1]})")
             with db.tx(con):
                 for j, r in enumerate(chunk):
                     ok = j not in failed and j < len(resp.results) and resp.results[j].resource_name
@@ -846,6 +885,9 @@ class Ads:
             "customer_id": self.cid, "operations": ops, "partial_failure": True})
         db.log_ops(self.con, len(ops), "remove")
         failed = self.partial_failures(resp)
+        for i, c in enumerate(camps):
+            log(f"remove campaign {c['name']}: "
+                f"{'FAILED ' + short(failed.get(i) or failed.get(None)) if (i in failed or None in failed) else 'removed'}")
         out = {}
         for i, c in enumerate(camps):
             ok = (i not in failed and None not in failed and i < len(resp.results)
@@ -892,6 +934,7 @@ class Ads:
         today = self.account_today()
         enh_on = 0
         updates = []
+        totals = {}
         for i in range(0, len(ids), 400):
             id_list = ",".join(ids[i:i + 400])
             q = ("SELECT ad_group_ad.resource_name, ad_group_ad.policy_summary.approval_status, "
@@ -915,13 +958,23 @@ class Ads:
                 q2 = ("SELECT ad_group_ad.resource_name, metrics.impressions, metrics.clicks "
                       f"FROM ad_group_ad WHERE campaign.id IN ({id_list}) "
                       f"AND segments.date BETWEEN '{since_date}' AND '{today}'")
-                for row in self.search(q2, "sync"):
+                for row in self.search(q2, "sync"):   # one row per ad per day: add them up
                     aid = by_ad.get(row.ad_group_ad.resource_name)
                     if aid:
-                        updates.append((aid, {"impressions": row.metrics.impressions,
-                                              "clicks": row.metrics.clicks}))
+                        t = totals.setdefault(aid, [0, 0])
+                        t[0] += row.metrics.impressions
+                        t[1] += row.metrics.clicks
+        updates += [(aid, {"impressions": i, "clicks": c}) for aid, (i, c) in totals.items()]
         with db.tx(con):
             for aid, fields in updates:
                 db.update_article(con, aid, **fields)
         db.kv_set(con, "enhancements_on_count", enh_on)
+        appr = {}
+        for aid, f in updates:
+            if "approval" in f:
+                appr[f["approval"]] = appr.get(f["approval"], 0) + 1
+        log(f"sync: {len(ids)} campaigns; approvals {appr or 'none yet'}; "
+            f"impressions {sum(i for i, _ in totals.values())}, clicks "
+            f"{sum(c for _, c in totals.values())} since {since_date or '-'}; "
+            f"ads with enhancements/auto video ON: {enh_on}")
         return enh_on
