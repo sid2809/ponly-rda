@@ -19,6 +19,11 @@ SETTINGS_DEFAULTS = [
     ["Auto-apply recommendations off", False, "Tick after checking Recommendations > "
                                               "Auto-apply in Google Ads"],
     ["Pilot categories", "", "4 food categories, separated by ;  (blank = 4 largest)"],
+    ["Articles per campaign (min)", 6, "Used when a wave's campaigns are planned. Counts that "
+                                       "cannot split exactly may go slightly over the max."],
+    ["Articles per campaign (max)", 8, ""],
+    ["Articles per ad group (min)", 2, "Same-theme articles are kept together"],
+    ["Articles per ad group (max)", 4, ""],
     ["Pause", True, "Ticked = worker paused (nothing new is started). Untick to run."],
 ]
 OUTPUT_HEADER = ["ID", "Category", "Title", "Final URL", "Alcohol", "Alcohol reason", "Wave",
@@ -57,12 +62,17 @@ class Sheet:
             self._call(self.svc.spreadsheets().batchUpdate(
                 spreadsheetId=self.sid, body={"requests": reqs}))
         vals = self.read("Settings")
+        if len(vals) >= 2:
+            have = {str(r[0]).strip() for r in vals if r}
+            missing = [r for r in SETTINGS_DEFAULTS[1:] if r[0] not in have]
+            if missing:
+                self.append("Settings", missing)
         if len(vals) < 2:
             self.write("Settings", SETTINGS_DEFAULTS, force=True)
             meta = self._call(self.svc.spreadsheets().get(spreadsheetId=self.sid))
             sid = next(s["properties"]["sheetId"] for s in meta["sheets"]
                        if s["properties"]["title"] == "Settings")
-            boxes = [1, 2, 3, 7, 9]  # rows with tick boxes (0-based)
+            boxes = [i for i, r in enumerate(SETTINGS_DEFAULTS) if r[1] is True or r[1] is False]
             self._call(self.svc.spreadsheets().batchUpdate(spreadsheetId=self.sid, body={
                 "requests": [{"setDataValidation": {
                     "range": {"sheetId": sid, "startRowIndex": r, "endRowIndex": r + 1,

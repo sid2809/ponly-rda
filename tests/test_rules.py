@@ -114,3 +114,14 @@ def test_cocktail_dishes_decided_food():
         assert hit is False and "decision" in why, t
     assert alcohol.keyword_check("Bourbon Shrimp Cocktail")[0] is True
     assert alcohol.keyword_check("Kale Salad")[0] is None
+
+
+def test_sizes_from_settings_generalise():
+    # old 8-12 rules fall out of the same logic: under 8 -> one, 13-15 -> one
+    assert split.campaign_sizes(7, 8, 12) == [7]
+    assert split.campaign_sizes(14, 8, 12) == [14]
+    assert all(8 <= x <= 12 for x in split.campaign_sizes(40, 8, 12))
+    assert split.campaign_sizes(9, 4, 8) == [5, 4]
+    # old ad-group rule: 5 with 3-4 -> one group of 5
+    assert split.adgroup_sizes(5, 3, 4) == [5]
+    assert split.adgroup_sizes(7, 3, 4) in ([3, 4], [4, 3])

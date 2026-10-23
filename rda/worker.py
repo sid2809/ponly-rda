@@ -144,7 +144,10 @@ class Worker:
                   if c.strip() in sizes]
         if len(chosen) < config.PILOT_FOOD_CATEGORIES:
             chosen = sorted(sizes, key=lambda c: -sizes[c])[:config.PILOT_FOOD_CATEGORIES]
-        plan = split.assign_waves(arts, set(chosen))
+        sz = self.sizes()
+        if not sz:
+            return
+        plan = split.assign_waves(arts, set(chosen), sz[0])
         for aid, (wave, side) in plan.items():
             model = {"A": "nano-banana", "B": "minimax"}.get(side)
             db.update_article(con, aid, wave=wave, pilot_side=side, image_model=model)
@@ -175,6 +178,22 @@ class Worker:
         st = self.wave_stats(w)
         return (st["uploaded"] > 0 and st["approved_share"] >= config.PASS_APPROVED_MIN
                 and st["bad_policy"] == 0 and st["image_fail_share"] <= config.PASS_IMAGE_FAIL_MAX)
+
+    def sizes(self):
+        """(campaign min, max, ad group min, max) from Settings; None if invalid."""
+        keys = ["Articles per campaign (min)", "Articles per campaign (max)",
+                "Articles per ad group (min)", "Articles per ad group (max)"]
+        defaults = [config.CAMPAIGN_MIN, config.CAMPAIGN_MAX, config.ADGROUP_MIN,
+                    config.ADGROUP_MAX]
+        try:
+            v = [int(float(self.settings.get(k) if self.settings.get(k) not in (None, "")
+                           else d)) for k, d in zip(keys, defaults)]
+        except (TypeError, ValueError):
+            v = None
+        ok = v and 1 <= v[0] <= v[1] and 1 <= v[2] <= v[3] and v[3] <= v[1]
+        db.kv_set(self.con, "sizes_error", None if ok else
+                  f"Invalid size settings {v}: need min <= max and ad group max <= campaign max")
+        return tuple(v) if ok else None
 
     def chosen_model(self):
         m = str(self.settings.get("Image model", "")).strip().lower()
@@ -326,9 +345,14 @@ class Worker:
         arts = [dict(r) for r in con.execute(
             "SELECT id,category,alcohol,theme,image_model FROM articles WHERE wave=? AND "
             "status='checked'", (w,))]
+        sz = self.sizes()
+        if not sz:
+            return   # invalid size settings: wait (reason shown in Summary)
         start_nn = {r["pool"]: r["m"] + 1 for r in con.execute(
             "SELECT pool, MAX(nn) m FROM campaigns GROUP BY pool")}
-        for c in split.plan_campaigns(arts, start_nn):
+        db.kv_set(con, f"sizes_used_{w}", sz)
+        self.log(f"wave {w}: planning with campaigns {sz[0]}-{sz[1]}, ad groups {sz[2]}-{sz[3]}")
+        for c in split.plan_campaigns(arts, start_nn, sz):
             ckey = f"w{w}-{c['pool']}-{c['nn']:03d}"
             con.execute("INSERT INTO campaigns(key,wave,pool,image_model,nn,theme,name,n) "
                         "VALUES(?,?,?,?,?,?,?,?)", (ckey, w, c["pool"], c["image_model"], c["nn"],
@@ -437,7 +461,10 @@ class Worker:
                 ["Preflight", json.dumps(db.kv_get(con, "preflight", {}))[:45000]],
                 ["Preflight passed", bool(db.kv_get(con, "preflight_passed"))],
                 ["Connections (checked at startup)", json.dumps(db.kv_get(con, "connections", {}))],
-                ["Pilot categories", "; ".join(db.kv_get(con, "pilot_categories", []))]]
+                ["Pilot categories", "; ".join(db.kv_get(con, "pilot_categories", []))],
+                ["Size settings problem", db.kv_get(con, "sizes_error") or "none"],
+                ["Sizes used per wave (campaign min-max, ad group min-max)",
+                 json.dumps({w: db.kv_get(con, f"sizes_used_{w}") for w in (1, 2, 3)})]]
         for k in sorted(counts):
             rows.append([f"Articles: {k}", counts[k]])
         failed = con.execute("SELECT name, error FROM campaigns WHERE status='failed'").fetchall()
