@@ -896,6 +896,7 @@ class Worker:
                 ["Preflight", json.dumps(db.kv_get(con, "preflight", {}))[:45000]],
                 ["Preflight passed", bool(db.kv_get(con, "preflight_passed"))],
                 ["Connections (checked at startup)", json.dumps(db.kv_get(con, "connections", {}))],
+                ["Live check (at startup)", json.dumps(db.kv_get(con, "live_check", {}))[:45000]],
                 ["Pilot categories", "; ".join(db.kv_get(con, "pilot_categories", []))],
                 ["Settings problems", "; ".join(db.kv_get(con, "settings_problems", [])) or "none"],
                 ["Size settings problem", db.kv_get(con, "sizes_error") or "none"],
@@ -1121,6 +1122,12 @@ def main():
     w.stop = stop
     w.log("Worker started. Sheet tabs ready.")
     db.kv_set(w.con, "connections", check_connections(w))
+    if not config.DRY_RUN:
+        try:
+            from . import livecheck
+            livecheck.run(w)              # read-only checks against the real accounts
+        except Exception:
+            w.log("live check error:\n" + traceback.format_exc())
     was_paused = None
     while not stop.is_set():
         try:

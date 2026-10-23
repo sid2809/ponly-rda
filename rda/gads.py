@@ -13,6 +13,7 @@ API_VERSION = "v26"
 MAX_ASSET_BYTES = 8_000_000          # one op must fit in a 9 MB add request (P8)
 LOST_TRIES = 10                      # missing job / unlistable results (R12)
 RUNNING_REPORT_S = 24 * 3600
+RECONCILE_DELAY_S = 900              # let Google's search index catch up before adopting
 
 
 def make_client():
@@ -506,6 +507,13 @@ class Ads:
         for j in db.open_jobs(con, "gads"):
             self._resume(j)
             return -1
+        due = db.kv_get(con, f"reconcile_due_{wave}")
+        if due:
+            if time.time() < due:
+                return -1                     # waiting before reconcile: build nothing yet
+            self.reconcile(wave)
+            con.execute("DELETE FROM kv WHERE k=?", (f"reconcile_due_{wave}",))
+            return -1
         if not self.has_work(wave) or quota_left < 50:
             return 0
         self.check_collisions(wave)
@@ -596,14 +604,18 @@ class Ads:
         svc = self.client.get_service("BatchJobService")
         try:   # read every page first; apply only when complete (R6/B5)
             results = []
-            for r in svc.list_batch_job_results(resource_name=res, page_size=1000):
+            for r in svc.list_batch_job_results(request={"resource_name": res,
+                                                         "page_size": 1000}):
                 code = r.status.code if r.status else 0
                 results.append((r.operation_index, code,
                                 self.decode_status(r.status) if code else None,
                                 None if code else self._resource_from_response(
                                     r.mutate_operation_response)))
-        except Exception:
+        except Exception as e:
             db.log_ops(con, 1, "batch_results")
+            msg = f"{type(e).__name__}: {e}"[:400]
+            db.kv_set(con, f"resume_error_{job['id']}", msg)
+            print(f"batch job {res}: results could not be listed: {msg}", flush=True)
             if self._fail_count(job) >= LOST_TRIES:
                 self._lost(job, "results could not be listed")
             return
@@ -616,9 +628,11 @@ class Ads:
             db.set_job(con, job["id"], state="done")
 
     def _lost(self, job, why):
+        """Reconcile only after a delay: right after a job, Google's search may not show
+        everything yet, and adopting too early would let the rebuild create duplicates."""
         db.set_job(self.con, job["id"], state="lost")
         db.kv_set(self.con, f"lost_job_{job['id']}", why)
-        self.reconcile(job["wave"])
+        db.kv_set(self.con, f"reconcile_due_{job['wave']}", time.time() + RECONCILE_DELAY_S)
 
     # ---------- reconcile by search (R13) ----------
     def reconcile(self, wave):
@@ -748,8 +762,8 @@ class Ads:
             logos[tag] = a.resource_name
         for _, ops, idx in self.iter_units(wave, logos, None):
             try:
-                svc.mutate(customer_id=self.cid, mutate_operations=logo_ops + ops,
-                           validate_only=True)
+                svc.mutate(request={"customer_id": self.cid, "validate_only": True,
+                                    "mutate_operations": logo_ops + ops})
             except Exception as e:
                 errors.append(str(e)[:2000])
             db.log_ops(self.con, len(ops) + 2, "validate")

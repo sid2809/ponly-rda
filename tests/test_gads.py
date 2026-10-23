@@ -64,8 +64,8 @@ class Stub:
         job["results"] = [self._exec(i, op) for i, op in enumerate(job["ops"])]
         job["status"] = "DONE"
 
-    def list_batch_job_results(self, resource_name, page_size):
-        return self.jobs[resource_name]["results"]
+    def list_batch_job_results(self, request):
+        return self.jobs[request["resource_name"]]["results"]
 
     def _ref(self, r):
         return self.temp.get(r, r) if r else r
@@ -189,6 +189,27 @@ class Stub:
         raise AssertionError(query)
 
 
+class Strict:
+    """Every call must bind to the REAL google-ads client method signature, so a wrong
+    keyword (like page_size= on list_batch_job_results) fails here as it does live."""
+
+    def __init__(self, stub, service):
+        import importlib
+        mod = importlib.import_module("google.ads.googleads.v26.services.services." +
+                                      re.sub(r"(?<!^)(?=[A-Z])", "_", service).lower())
+        self.real = getattr(mod, service + "Client")
+        self.stub = stub
+
+    def __getattr__(self, name):
+        import inspect
+        sig = inspect.signature(getattr(self.real, name))
+
+        def call(*a, **k):
+            sig.bind(None, *a, **k)            # raises TypeError on a bad keyword
+            return getattr(self.stub, name)(*a, **k)
+        return call
+
+
 def setup(tmp, fail_types=(), n_articles=4):
     config.KEEP_IMAGES = False
     config.IMG_DIR = os.path.join(tmp, "img")
@@ -206,7 +227,7 @@ def setup(tmp, fail_types=(), n_articles=4):
 
     ads = TAds(con, client)
     ads.cid = "1"
-    client.get_service = lambda name, **k: stub
+    client.get_service = lambda name, **k: Strict(stub, name)
     copy = {"headlines": ["a", "b", "c", "d", "e"], "long_headline": "l",
             "descriptions": ["1", "2", "3", "4", "5"], "image_prompt": "p"}
     con.execute("INSERT INTO campaigns(key,wave,pool,nn,theme,name,n) VALUES('c1',1,'P',1,'T','C1',4)")
@@ -306,8 +327,11 @@ def test_pending_after_run_waits_then_removed_and_rebuilt_once():
         assert con.execute("SELECT state FROM jobs").fetchone()["state"] == "run_requested"
         assert not stub.created_counts
         con.execute("UPDATE jobs SET created=?", (time.time() - 25 * 3600,))
-        drive(ads, logos)
+        drive(ads, logos, 2)
         assert stub.jobs[job["external_id"]]["status"] == "REMOVED"
+        assert not stub.created_counts           # reconcile delay before any rebuild
+        con.execute("UPDATE kv SET v=? WHERE k='reconcile_due_1'", (json.dumps(time.time() - 1),))
+        drive(ads, logos)
         assert_once(stub)
         assert uploaded(con) == 4
 
@@ -321,6 +345,10 @@ def test_lost_job_is_reconciled_without_duplicates():
             ads.run_upload(1, logos, 10000)
         assert con.execute("SELECT state FROM jobs").fetchone()["state"] == "lost"
         stub.hide_jobs = False
+        before = dict(stub.created_counts)
+        drive(ads, logos, 3)                    # reconcile waits (search may lag)
+        assert stub.created_counts == before and uploaded(con) == 0
+        con.execute("UPDATE kv SET v=? WHERE k='reconcile_due_1'", (json.dumps(time.time() - 1),))
         drive(ads, logos)
         assert_once(stub)                       # reconcile adopted it all
         assert stub.created_counts["campaign_label_operation"] == 2
@@ -459,3 +487,45 @@ def test_decode_status_reads_google_ads_failure():
         st = stub._failure([0], "too many campaigns")
         assert "too many campaigns" in ads.decode_status(st)
         assert ads.decode_status(NS(details=[], message="plain", code=3)) == "plain"
+
+
+def test_validate_wave_uses_real_signature():
+    with tempfile.TemporaryDirectory() as tmp:
+        con, ads, stub, logos = setup(tmp)
+        seen = []
+        stub.mutate = lambda request: seen.append(request["validate_only"])
+        config.LOGO_LANDSCAPE = config.LOGO_LANDSCAPE   # real logo files in assets/
+        assert ads.validate_wave(1) == [] and seen == [True]
+
+
+def _live_worker(con, ads):
+    from rda import fakes
+    claude = fakes.FakeClaude()
+    claude.c = NS(messages=NS(batches=NS(retrieve=lambda bid: NS(request_counts=NS(
+        processing=0, succeeded=len(claude.batches[bid]), errored=0, canceled=0, expired=0)))))
+    logs = []
+    return NS(con=con, ads=ads, claude=claude, rep=fakes.FakeReplicate(),
+              log=logs.append, logs=logs)
+
+
+def test_live_check_runs_and_finds_duplicates():
+    from rda import livecheck
+    with tempfile.TemporaryDirectory() as tmp:
+        con, ads, stub, logos = setup(tmp)
+        drive(ads, logos)
+        w = _live_worker(con, ads)
+        bid = w.claude.create_batch([("alc-a0", {"output_config": {"format": {"schema": {
+            "properties": {"alcohol": {}}}}}, "messages": [{"content": "x"}]})])
+        db.new_job(con, "alcohol", payload={}, external_id=bid, state="done")
+        w.claude.find_batch = lambda a, b, n: [bid]
+        livecheck.run(w)
+        res = db.kv_get(con, "live_check")["results"]
+        fails = [r for r in res if not r.startswith("OK")]
+        # volume is not a mount in tests; everything else must pass
+        assert [f.split(":")[0] for f in fails] == ["FAIL volume"], fails
+        assert any("batch results" in r and "0 errors" in r for r in res)
+        g, u, r = stub.ent["ad"][0]
+        stub.ent["ad"].append((g, u, r + "dup"))                   # a duplicate ad
+        livecheck.run(w)
+        res = db.kv_get(con, "live_check")["results"]
+        assert any(r.startswith("FAIL Google Ads duplicates") and "ad x2" in r for r in res)
