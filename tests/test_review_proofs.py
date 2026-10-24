@@ -181,3 +181,45 @@ def test_skip_log_printed_only_after_commit(tmp, capsys):
     with db.tx(con):
         db.update_article(con, "iiiiiiiiiiii", status="skipped", skip_reason="y")
     assert "article SKIPPED" in capsys.readouterr().out
+
+
+def test_account_wide_refusal_never_skips_the_wave(tmp):
+    """401/403/404 (token, account, model) pause the step; no article loses an attempt."""
+    config.IMAGE_GAP_S = (0, 0)
+    w = make(every=200)
+    con = w.con
+    for i in range(5):
+        _wave_article(con, f"{i}jjjjjjjjjjj", "copy_done")
+
+    def create(ref, inputs):
+        from replicate.exceptions import ReplicateError
+        raise ReplicateError(status=401, detail="invalid token")
+    w.rep.create = create
+    w.settings = {"Image model": "minimax", "Pause": False}
+    for _ in range(5):
+        w.run_step("images:w2", w.step_images, 2, backoff=False)
+    rows = con.execute("SELECT status, image_attempts FROM articles WHERE id LIKE '%jjj'").fetchall()
+    assert all((r["status"], r["image_attempts"]) == ("copy_done", 0) for r in rows)
+
+
+def test_many_per_request_refusals_stop_the_step(tmp):
+    """Even 422s: 3 in a row with nothing started stops the step (protects the wave)."""
+    config.IMAGE_GAP_S = (0, 0)
+    w = make(every=200)
+    con = w.con
+    for i in range(6):
+        _wave_article(con, f"{i}kkkkkkkkkkk", "copy_done")
+
+    def create(ref, inputs):
+        from replicate.exceptions import ReplicateError
+        raise ReplicateError(status=422, detail="bad input")
+    w.rep.create = create
+    w.settings = {"Image model": "minimax", "Pause": False}
+    w.run_step("images:w2", w.step_images, 2, backoff=False)
+    used = con.execute("SELECT SUM(image_attempts) FROM articles WHERE id LIKE '%kkk'").fetchone()[0]
+    assert used == 2 and "in a row refused" in db.kv_get(con, "step_errors")["images:w2"]["error"]
+
+
+def test_sheets_429_is_not_a_google_ads_quota_wait(tmp):
+    from rda.gads import is_quota_error
+    assert not is_quota_error(RuntimeError("HttpError 429 RESOURCE_EXHAUSTED (Sheets)"))

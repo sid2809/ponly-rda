@@ -160,7 +160,9 @@ def run(w):
                     if have.count(n) > 1]
             want = set(ads.wanted_labels(c))
             if want - set(have):
-                if (c["label_attempts"] or 0) < 3:     # the worker adds these on its next loop
+                if c["status"] == "held":
+                    pass                               # kept paused on purpose; not labelled
+                elif (c["label_attempts"] or 0) < 3:   # the worker adds these on its next loop
                     pending.append(f"{c['name']}: {sorted(want - set(have))}")
                 else:
                     mism.append(f"{c['name']}: labels missing {sorted(want - set(have))}")

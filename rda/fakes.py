@@ -198,7 +198,7 @@ def fake_ads(con):
             db.log_ops(self.con, n, "enable")
             return n
 
-        def sync(self, since):
+        def sync(self, since, metrics_only=False):
             db.log_ops(self.con, 2, "sync")
             for r in self.con.execute("SELECT id FROM articles WHERE status='uploaded'"):
                 db.update_article(self.con, r["id"], approval="APPROVED",

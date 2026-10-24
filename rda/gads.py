@@ -21,7 +21,12 @@ ENABLE_TRIES = 3
 
 
 def is_quota_error(e):
-    """RESOURCE_EXHAUSTED from any Google Ads call (search or mutate)."""
+    """RESOURCE_EXHAUSTED from a Google Ads call (search or mutate) only: a Google Sheets 429
+    or another service's limit must not pause the Google Ads steps."""
+    if isinstance(e, QuotaExhausted):
+        return True
+    if type(e).__name__ != "GoogleAdsException":
+        return False
     code = ""
     try:
         code = e.error.code().name
@@ -165,7 +170,7 @@ class Ads:
         con = self.con
         camps = [dict(c) for c in con.execute(
             "SELECT * FROM campaigns WHERE campaign_res IS NOT NULL AND status IN "
-            "('created','enabled') AND COALESCE(label_attempts,0)<3")
+            "('created','enabled','held') AND COALESCE(label_attempts,0)<3")
             if db.kv_get(con, f"uploaded_{c['wave']}")]
         todo = []
         for c in camps:
@@ -969,6 +974,29 @@ class Ads:
             if g["adgroup_res"] and g["adgroup_res"] not in confirmed:
                 hold[g["campaign_key"]] = (f"18-24 exclusion not found in Google Ads on ad "
                                            f"group {g['name']}")
+        # every ad group Google has in an alcohol campaign, even one missing from the database
+        alc_camps = {r["campaign_res"]: r["key"] for r in rows if r["pool"] == "ALCOHOL"}
+        known_alc = {g["adgroup_res"] for g in alc}
+        extra = {}
+        for part in _chunks(list(alc_camps)):
+            qq = ",".join(_q(r) for r in part)
+            for x in self.search("SELECT campaign.resource_name, ad_group.resource_name FROM "
+                                 f"ad_group WHERE campaign.resource_name IN ({qq}) AND "
+                                 "ad_group.status != 'REMOVED'", "pre_enable"):
+                if x.ad_group.resource_name not in known_alc:
+                    extra[x.ad_group.resource_name] = alc_camps[x.campaign.resource_name]
+        for part in _chunks(list(extra)):
+            qq = ",".join(_q(r) for r in part)
+            for x in self.search("SELECT ad_group.resource_name, ad_group_criterion.age_range.type "
+                                 f"FROM ad_group_criterion WHERE ad_group.resource_name IN ({qq}) "
+                                 "AND ad_group_criterion.type = 'AGE_RANGE' AND "
+                                 "ad_group_criterion.negative = TRUE AND "
+                                 "ad_group_criterion.status != 'REMOVED'", "pre_enable"):
+                if x.ad_group_criterion.age_range.type_.name == "AGE_RANGE_18_24":
+                    extra.pop(x.ad_group.resource_name, None)
+        for ag, key in extra.items():
+            hold.setdefault(key, f"ad group {ag.split('/')[-1]} in Google Ads has no 18-24 "
+                                 f"exclusion (not in the database)")
         for r in rows:
             if not ads_n.get(r["key"]):
                 hold.setdefault(r["key"], "no ads uploaded in this campaign")
@@ -1031,9 +1059,10 @@ class Ads:
         hold, ads_n = self.pre_enable_check(rows)
         for r in rows:
             if r["key"] in hold:
-                con.execute("UPDATE campaigns SET error=? WHERE key=?",
-                            (f"not enabled: {hold[r['key']]}"[:500], r["key"]))
-                log(f"enable HELD (kept paused): campaign {r['name']}: {hold[r['key']]}")
+                msg = f"not enabled: {hold[r['key']]}"[:500]
+                if r["error"] != msg:                  # log once per new reason
+                    log(f"enable HELD (kept paused): campaign {r['name']}: {hold[r['key']]}")
+                con.execute("UPDATE campaigns SET error=? WHERE key=?", (msg, r["key"]))
         rows = [r for r in rows if r["key"] not in hold]
         berr = self.resize_budgets(rows, ads_n)
         for k, e in berr.items():
@@ -1129,7 +1158,8 @@ class Ads:
             return datetime.datetime.now(datetime.timezone.utc).date().isoformat()
 
     # ---------- daily sync ----------
-    def sync(self, since_date):
+    def sync(self, since_date, metrics_only=False):
+        """metrics_only: just impressions, clicks and cost (cheap; run hourly while spending)."""
         con = self.con
         ids = [r["campaign_res"].split("/")[-1] for r in con.execute(
             "SELECT campaign_res FROM campaigns WHERE campaign_res IS NOT NULL AND "
@@ -1149,7 +1179,7 @@ class Ads:
                  "ad_group_ad.ad.responsive_display_ad.control_spec.enable_asset_enhancements, "
                  "ad_group_ad.ad.responsive_display_ad.control_spec.enable_autogen_video "
                  f"FROM ad_group_ad WHERE campaign.id IN ({id_list})")
-            for row in self.search(q, "sync"):
+            for row in ([] if metrics_only else self.search(q, "sync")):
                 aga = row.ad_group_ad
                 aid = by_ad.get(aga.resource_name)
                 if not aid:
@@ -1161,23 +1191,6 @@ class Ads:
                 updates.append((aid, {"approval": aga.policy_summary.approval_status.name,
                                       "review_status": aga.policy_summary.review_status.name,
                                       "policy_note": topics or None}))
-            # image/text disapprovals are reported per asset, not on the ad
-            q3 = ("SELECT ad_group_ad_asset_view.ad_group_ad, ad_group_ad_asset_view.field_type, "
-                  "ad_group_ad_asset_view.policy_summary.approval_status FROM "
-                  f"ad_group_ad_asset_view WHERE campaign.id IN ({id_list})")
-            try:
-                for row in self.search(q3, "sync"):
-                    v = row.ad_group_ad_asset_view
-                    aid = by_ad.get(v.ad_group_ad)
-                    st = v.policy_summary.approval_status.name
-                    if aid and st in ("DISAPPROVED", "APPROVED_LIMITED", "AREA_OF_INTEREST_ONLY"):
-                        asset_notes.setdefault(aid, []).append(f"{v.field_type.name} {st}")
-                    elif aid:
-                        asset_notes.setdefault(aid, [])
-            except QuotaExhausted:
-                raise
-            except Exception as e:
-                log(f"sync: asset policy could not be read: {short(e, 200)}")
             if since_date:
                 q2 = ("SELECT ad_group_ad.resource_name, metrics.impressions, metrics.clicks, "
                       "metrics.cost_micros "
@@ -1192,12 +1205,37 @@ class Ads:
                         t[2] += row.metrics.cost_micros
         updates += [(aid, {"impressions": i, "clicks": c, "cost": round(m / 1e6, 2)})
                     for aid, (i, c, m) in totals.items()]
+        # image approvals: ad_group_ad_asset_view does not support responsive display ads, so
+        # read each uploaded image asset's own policy summary instead
+        by_asset = {}
+        for r in con.execute("SELECT id, landscape_asset, square_asset FROM articles WHERE "
+                             "status='uploaded'"):
+            for col, tag in (("landscape_asset", "landscape image"), ("square_asset",
+                                                                     "square image")):
+                if r[col]:
+                    by_asset[r[col]] = (r["id"], tag)
+        seen = 0
+        for part in ([] if metrics_only else _chunks(list(by_asset))):
+            qa = ",".join(_q(x) for x in part)
+            for row in self.search("SELECT asset.resource_name, asset.policy_summary.approval_status, "
+                                   "asset.policy_summary.review_status FROM asset WHERE "
+                                   f"asset.resource_name IN ({qa})", "sync"):
+                seen += 1
+                aid, tag = by_asset.get(row.asset.resource_name, (None, None))
+                st = row.asset.policy_summary.approval_status.name
+                if aid:
+                    notes = asset_notes.setdefault(aid, [])
+                    if st in ("DISAPPROVED", "APPROVED_LIMITED", "AREA_OF_INTEREST_ONLY"):
+                        notes.append(f"{tag} {st}")
+        if by_asset and not seen and not metrics_only:
+            log(f"sync WARNING: none of {len(by_asset)} image assets could be read back")
         updates += [(aid, {"asset_policy": "; ".join(n) or None})
                     for aid, n in asset_notes.items()]
         with db.tx(con):
             for aid, fields in updates:
                 db.update_article(con, aid, **fields)
-        db.kv_set(con, "enhancements_on_count", enh_on)
+        if not metrics_only:
+            db.kv_set(con, "enhancements_on_count", enh_on)
         appr = {}
         for aid, f in updates:
             if "approval" in f:

@@ -207,13 +207,23 @@ class Worker:
                 db.kv_set(self.con, "step_errors", errs)
         except QuotaExhausted as e:
             db.rollback_if_open(self.con)
-            db.kv_set(self.con, "quota_wait_until", time.time() + 3600)
-            self.log(f"{key}: Google Ads quota exhausted, waiting 1 h ({e})")
+            temporary = "TEMPORARILY" in str(e)
+            wait = 300 if temporary else 3600
+            db.kv_set(self.con, "quota_wait_until", time.time() + wait)
+            db.kv_set(self.con, "quota_wait_reason", f"{key}: {short(e, 200)}")
+            self.log(f"{key}: Google Ads {'rate limit' if temporary else 'quota'} hit, waiting "
+                     f"{wait // 60} min ({e})")
         except Exception as e:
             db.rollback_if_open(self.con)
-            if is_quota_error(e):                     # a mutate call hit the daily limit
-                db.kv_set(self.con, "quota_wait_until", time.time() + 3600)
-                self.log(f"{key}: Google Ads quota exhausted, waiting 1 h ({short(e, 200)})")
+            if is_quota_error(e):                     # a Google Ads limit was hit
+                temporary = "TEMPORARILY" in str(e) + str(getattr(e, "failure", ""))
+                wait = 300 if temporary else 3600
+                db.kv_set(self.con, "quota_wait_until", time.time() + wait)
+                db.kv_set(self.con, "quota_wait_reason",
+                          f"{key}: {'short-term rate limit' if temporary else 'daily quota'}: "
+                          f"{short(e, 200)}")
+                self.log(f"{key}: Google Ads {'rate limit' if temporary else 'quota'} hit, "
+                         f"waiting {wait // 60} min ({short(e, 200)})")
                 return
             n = e0.get("count", 0) + 1
             until = time.time() + BACKOFF_S[min(n - 3, 2)] if (backoff and n >= 3) else 0
@@ -354,7 +364,8 @@ class Worker:
         found = []
         if n:
             try:
-                found = self.claude.find_batch(j["created"] - 10, j["created"] + 120, n)
+                # create may take until the client timeout (10 min) before it fails
+                found = self.claude.find_batch(j["created"] - 10, j["created"] + 900, n)
             except Exception as e:
                 self.log(f"find_batch failed: {e}")
                 return                                   # try again next tick
@@ -761,6 +772,10 @@ class Worker:
             try:
                 images.start_prediction(con, self.rep, a, model, extra)
             except images.StartRejected as e:      # this article only; the rest carry on
+                counts["refused"] = counts.get("refused", 0) + 1
+                if counts["refused"] >= 3 and not counts["started"]:
+                    raise RuntimeError(f"3 image requests in a row refused ({e}); stopping "
+                                       f"the step instead of using up articles' attempts")
                 n = (a["image_attempts"] or 0) + 1
                 if n >= 3:
                     db.update_article(con, a["id"], status="skipped", image_attempts=n,
@@ -913,8 +928,9 @@ class Worker:
     # ---------------------------------------------------------------- enable
     def step_enable(self, w):
         """First tick after 'W enable': enable everything that passes the pre-enable check.
-        Afterwards, every 30 min, retry campaigns still paused (held or failed), so one
-        failure never leaves a campaign off without anyone noticing."""
+        Afterwards, every 30 min, re-check campaigns still 'created' (not enabled because the
+        check found a problem, or the enable failed: up to 3 tries). Campaigns 'held' (18-24
+        exclusion could not be added after 5 tries) stay paused until fixed by hand."""
         con = self.con
         if not db.kv_get(con, f"uploaded_{w}") or not self.s_bool(f"W{w} enable"):
             return
@@ -945,11 +961,16 @@ class Worker:
         # every 6 h while a wave is live but has not passed yet, else daily
         waiting = any(db.kv_get(con, f"enabled_{w}") and not self.wave_passed(w) for w in (1, 2, 3))
         interval = 6 * 3600 if waiting else 86400
-        if time.time() - last < interval and not db.kv_get(con, "sync_now"):
-            return
         since = db.kv_get(con, "enabled_date_1")
+        if time.time() - last < interval and not db.kv_get(con, "sync_now"):
+            # spend: clicks and cost every hour while any wave is live (cheap query)
+            if since and time.time() - db.kv_get(con, "last_cost_sync", 0) >= 3600:
+                self.ads.sync(since, metrics_only=True)
+                db.kv_set(con, "last_cost_sync", time.time())
+            return
         on = self.ads.sync(since)
         db.kv_set(con, "last_sync", time.time())
+        db.kv_set(con, "last_cost_sync", time.time())
         db.kv_set(con, "sync_now", False)
         if db.kv_get(con, "enabled_3"):
             db.kv_set(con, "final_sync_done", True)
@@ -1118,6 +1139,7 @@ class Worker:
                       "SELECT wave, SUM(cost) FROM articles WHERE status='uploaded' GROUP BY wave")})],
                  ["Report write problems", "; ".join(db.kv_get(con, "report_errors", [])) or "none"],
                  ["Google Ads API operations, last 24 h", db.ops_last_24h(con)],
+                 ["Google Ads quota wait reason", db.kv_get(con, "quota_wait_reason") or "none"],
                  ["Google Ads quota wait until",
                   time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(db.kv_get(con, "quota_wait_until")))
                   if db.kv_get(con, "quota_wait_until", 0) > time.time() else "none"],

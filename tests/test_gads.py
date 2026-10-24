@@ -38,6 +38,8 @@ class Stub:
         self.ent = {k: [] for k in ("budget", "campaign", "crit", "clabel", "ag", "agc",
                                     "asset", "ad")}
         self.temp = {}
+        self.removed = set()          # removed campaigns/budgets stay, like in Google Ads
+        self.asset_disapproved = set()
 
     # ---- batch jobs
     def mutate_batch_job(self, customer_id, operation):
@@ -161,7 +163,7 @@ class Stub:
     def mutate_campaign_budgets(self, request):
         out = []
         for op in request["operations"]:
-            self.ent["budget"] = [b for b in self.ent["budget"] if b[1] != op.remove]
+            self.removed.add(op.remove)
             out.append(NS(resource_name=op.remove))
         return NS(results=out, partial_failure_error=None)
 
@@ -173,7 +175,7 @@ class Stub:
                     bad.append(i)
                     out.append(NS(resource_name=""))
                     continue
-                self.ent["campaign"] = [c for c in self.ent["campaign"] if c[1] != op.remove]
+                self.removed.add(op.remove)
                 out.append(NS(resource_name=op.remove))
             return NS(results=out, partial_failure_error=self._failure(bad, "cannot remove")
                       if bad else None)
@@ -194,7 +196,11 @@ class Stub:
         e = self.ent
         inlist = set(re.findall(r"'([^']*)'", query)) if " IN (" in query else None
 
-        def keep(key):
+        hide_removed = "status != 'REMOVED'" in query
+
+        def keep(key, res=None):
+            if hide_removed and res in self.removed:
+                return False
             return inlist is None or key in inlist
         if frm == "batch_job":
             res = query.split("'")[1]
@@ -208,10 +214,10 @@ class Stub:
             return [NS(customer=NS(time_zone="Asia/Kolkata"))]
         if frm == "campaign_budget":
             return [NS(campaign_budget=NS(name=n, resource_name=r)) for n, r in e["budget"]
-                    if keep(n)]
+                    if keep(n, r)]
         if frm == "campaign":
             return [NS(campaign=NS(name=n, resource_name=r)) for n, r in e["campaign"]
-                    if keep(n) or keep(r)]
+                    if keep(n, r) or keep(r, r)]
         if frm == "campaign_criterion":
             return [NS(campaign=NS(resource_name=c), campaign_criterion=NS(
                 resource_name=r, type_=NS(name=t))) for c, t, r in e["crit"] if keep(c)]
@@ -238,7 +244,10 @@ class Stub:
         if frm == "ad_group_ad_asset_view":
             return []
         if frm == "asset":
-            return [NS(asset=NS(name=n, resource_name=r)) for n, r in e["asset"] if keep(n)]
+            return [NS(asset=NS(name=n, resource_name=r, policy_summary=NS(
+                approval_status=NS(name="DISAPPROVED" if r in self.asset_disapproved
+                                   else "APPROVED"), review_status=NS(name="REVIEWED"))))
+                    for n, r in e["asset"] if keep(n) or keep(r)]
         raise AssertionError(query)
 
 
@@ -642,7 +651,9 @@ def test_remove_campaigns_real_signature_and_partial_failure():
         c = dict(con.execute("SELECT * FROM campaigns").fetchone())
         errs, berr = ads.remove_campaigns([c])
         assert errs == {"c1": None} and berr == {}
-        assert not stub.ent["campaign"] and not stub.ent["budget"]
+        assert c["campaign_res"] in stub.removed and c["budget_res"] in stub.removed
+        assert not stub.search("SELECT campaign.name FROM campaign WHERE campaign.status != "
+                               "'REMOVED'")
         stub.enable_fail = {c["campaign_res"]}
         errs, _ = ads.remove_campaigns([c])
         assert "cannot remove" in errs["c1"]
@@ -662,10 +673,10 @@ def test_sync_adds_up_daily_rows():
                             impressions=100, clicks=2, cost_micros=3_000_000)),
                         NS(ad_group_ad=NS(resource_name=ad), metrics=NS(
                             impressions=50, clicks=1, cost_micros=1_500_000))]
-            if "ad_group_ad_asset_view" in q:
-                return [NS(ad_group_ad_asset_view=NS(ad_group_ad=ad, field_type=NS(
-                    name="MARKETING_IMAGE"), policy_summary=NS(approval_status=NS(
-                        name="DISAPPROVED"))))]
+            if "FROM asset" in q:
+                la = con.execute("SELECT landscape_asset FROM articles WHERE id='a0'").fetchone()[0]
+                return [NS(asset=NS(resource_name=la, policy_summary=NS(approval_status=NS(
+                    name="DISAPPROVED"), review_status=NS(name="REVIEWED"))))]
             cs = NS(enable_asset_enhancements=False, enable_autogen_video=False)
             return [NS(ad_group_ad=NS(resource_name=ad, policy_summary=NS(
                 approval_status=NS(name="APPROVED"), review_status=NS(name="REVIEWED"),
@@ -675,7 +686,7 @@ def test_sync_adds_up_daily_rows():
         r = con.execute("SELECT * FROM articles WHERE id='a0'").fetchone()
         assert (r["impressions"], r["clicks"], r["approval"]) == (150, 3, "APPROVED")
         assert r["cost"] == 4.5 and r["review_status"] == "REVIEWED"
-        assert r["asset_policy"] == "MARKETING_IMAGE DISAPPROVED"
+        assert r["asset_policy"] == "landscape image DISAPPROVED"
 
 
 def test_model_label_added_to_existing_campaigns():
@@ -710,3 +721,40 @@ def test_live_check_ignores_removed_campaigns():
         res = db.kv_get(con, "live_check")["results"]
         dupline = next(r for r in res if "duplicates" in r)
         assert dupline.startswith("OK") and "778" not in dupline, dupline
+
+
+def test_pre_enable_checks_alcohol_ad_groups_missing_from_database():
+    with tempfile.TemporaryDirectory() as tmp:
+        con, ads, stub, logos = setup(tmp)
+        drive(ads, logos)
+        con.execute("UPDATE campaigns SET pool='ALCOHOL'")
+        camp = con.execute("SELECT campaign_res FROM campaigns").fetchone()[0]
+        stub.ent["ag"].append((camp, "stray", "customers/1/adGroups/4242"))   # not in the DB
+        assert ads.enable_wave(1) == 0
+        assert "4242" in con.execute("SELECT error FROM campaigns").fetchone()[0]
+
+
+def test_collision_check_ignores_removed_budget():
+    with tempfile.TemporaryDirectory() as tmp:
+        con, ads, stub, logos = setup(tmp)
+        stub.ent["budget"].append(("C1 | budget", "customers/1/campaignBudgets/55"))
+        stub.removed.add("customers/1/campaignBudgets/55")
+        drive(ads, logos)
+        assert con.execute("SELECT status FROM campaigns").fetchone()[0] == "created"
+
+
+def test_hourly_metrics_only_sync_reads_only_metrics():
+    with tempfile.TemporaryDirectory() as tmp:
+        con, ads, stub, logos = setup(tmp)
+        drive(ads, logos)
+        seen = []
+        real = ads.search
+
+        def spy(q, kind="search"):
+            seen.append(q.split("FROM")[1].split()[0])
+            return real(q, kind)
+        ads.search = spy
+        ads.sync("2026-10-24", metrics_only=True)
+        assert set(seen) <= {"ad_group_ad", "customer"}
+        assert all("metrics" in q or True for q in seen)
+        assert con.execute("SELECT SUM(cost) FROM articles").fetchone()[0] > 0

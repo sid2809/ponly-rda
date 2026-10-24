@@ -102,7 +102,9 @@ def start_prediction(con, client, article, model_key, extra_rule=""):
         pid = client.create(m["ref"], {"prompt": prompt, **m["input"]})
     except Exception as e:
         status = getattr(e, "status", None)
-        if isinstance(status, int) and 400 <= status < 500 and status not in (402, 429):
+        # only statuses about THIS request; 401/403/404 (token, account, model) and 402/429
+        # and 5xx are account-wide and must pause the step, never use up articles' attempts
+        if status in (400, 409, 413, 422):
             raise StartRejected(f"Replicate refused the request ({status}): {short(e, 200)}")
         raise
     with db.tx(con):
@@ -149,6 +151,10 @@ def poll_predictions(con, client):
             status, url, err = client.get(p["id"])
         except Exception as e:
             if age > PREDICTION_TIMEOUT_S:
+                try:
+                    client.cancel(p["id"])         # don't let it finish (and bill) unseen
+                except Exception:
+                    pass
                 _fail_prediction(con, p, f"status unreadable after {int(age // 60)} min: "
                                          f"{type(e).__name__}")
             else:
