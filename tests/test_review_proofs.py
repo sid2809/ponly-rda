@@ -223,3 +223,28 @@ def test_many_per_request_refusals_stop_the_step(tmp):
 def test_sheets_429_is_not_a_google_ads_quota_wait(tmp):
     from rda.gads import is_quota_error
     assert not is_quota_error(RuntimeError("HttpError 429 RESOURCE_EXHAUSTED (Sheets)"))
+
+
+def test_refusal_streak_survives_loops(tmp):
+    """A 422 on every request: across loops at most 2 articles are charged in total."""
+    config.IMAGE_GAP_S = (0, 0)
+    w = make(every=200)
+    con = w.con
+    for i in range(6):
+        _wave_article(con, f"{i}lllllllllll", "copy_done")
+
+    def create(ref, inputs):
+        from replicate.exceptions import ReplicateError
+        raise ReplicateError(status=422, detail="schema changed")
+    w.rep.create = create
+    w.settings = {"Image model": "minimax", "Pause": False}
+    for _ in range(5):
+        w.run_step("images:w2", w.step_images, 2, backoff=False)
+    used = con.execute("SELECT SUM(image_attempts) FROM articles WHERE id LIKE '%lll'").fetchone()[0]
+    assert used == 2
+
+
+def test_raw_resource_exhausted_is_a_quota_wait(tmp):
+    from google.api_core.exceptions import ResourceExhausted
+    from rda.gads import is_quota_error
+    assert is_quota_error(ResourceExhausted("quota"))

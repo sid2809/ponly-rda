@@ -25,6 +25,18 @@ def is_quota_error(e):
     or another service's limit must not pause the Google Ads steps."""
     if isinstance(e, QuotaExhausted):
         return True
+    try:                                          # raw gRPC / api_core limit errors
+        from google.api_core.exceptions import ResourceExhausted
+        if isinstance(e, ResourceExhausted):
+            return True
+    except ImportError:
+        pass
+    if type(e).__name__ == "_InactiveRpcError" or (hasattr(e, "code") and callable(e.code)
+                                                     and "grpc" in type(e).__module__):
+        try:
+            return e.code().name == "RESOURCE_EXHAUSTED"
+        except Exception:
+            return False
     if type(e).__name__ != "GoogleAdsException":
         return False
     code = ""
@@ -208,9 +220,11 @@ class Ads:
                     added += 1
                     db._log_after_commit(con, f"label '{n}' added to campaign {c['name']}")
                 else:
-                    con.execute("UPDATE campaigns SET label_attempts=?, error=? WHERE key=?",
-                                ((row["label_attempts"] or 0) + 1,
-                                 f"label '{n}': {err}"[:500], c["key"]))
+                    # never overwrite a 'not enabled: ...' reason (held count in Summary)
+                    con.execute("UPDATE campaigns SET label_attempts=?, error=CASE WHEN "
+                                "error LIKE 'not enabled%' OR status='held' THEN error ELSE ? "
+                                "END WHERE key=?", ((row["label_attempts"] or 0) + 1,
+                                                    f"label '{n}': {err}"[:500], c["key"]))
                     db._log_after_commit(con, f"label '{n}' FAILED on campaign {c['name']}: "
                                               f"{short(err, 300)}")
         return added

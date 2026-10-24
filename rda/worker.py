@@ -772,10 +772,14 @@ class Worker:
             try:
                 images.start_prediction(con, self.rep, a, model, extra)
             except images.StartRejected as e:      # this article only; the rest carry on
-                counts["refused"] = counts.get("refused", 0) + 1
-                if counts["refused"] >= 3 and not counts["started"]:
-                    raise RuntimeError(f"3 image requests in a row refused ({e}); stopping "
-                                       f"the step instead of using up articles' attempts")
+                # consecutive refusals across loops: a model/input change that refuses every
+                # request must stop the step, not slowly use up every article's attempts
+                streak = db.kv_get(con, "image_refusal_streak", 0) + 1
+                db.kv_set(con, "image_refusal_streak", streak)
+                if streak >= 3:
+                    raise RuntimeError(f"{streak} image requests in a row refused ({e}); "
+                                       f"stopping the step instead of using up articles' "
+                                       f"attempts")
                 n = (a["image_attempts"] or 0) + 1
                 if n >= 3:
                     db.update_article(con, a["id"], status="skipped", image_attempts=n,
@@ -788,6 +792,7 @@ class Worker:
             finally:
                 db.kv_set(con, "last_image_request", time.time())
             counts["started"] += 1
+            db.kv_set(con, "image_refusal_streak", 0)
             if regen:   # regeneration: record its cost (only once it was really started)
                 db.update_article(con, a["id"], regen_cost=(a["regen_cost"] or 0) +
                                   config.IMAGE_MODELS[model]["est_usd"])
