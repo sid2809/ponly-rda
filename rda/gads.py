@@ -116,7 +116,7 @@ class Ads:
                 rows.extend(batch.results)
         except Exception as e:
             if is_quota_error(e):
-                raise QuotaExhausted(str(e)[:300])
+                raise QuotaExhausted(str(e)[:300]) from e
             raise
         return rows
 

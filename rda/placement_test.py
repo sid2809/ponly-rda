@@ -35,6 +35,8 @@ SETTING = "Run placement test"
 TAB_IN = "Placements"
 TAB_OUT = "Placement test"
 CHUNK_2 = 500
+TEMP_TRIES = 10             # short-term rate limit: same request again, 60 s apart
+TEMP_WAIT_S = 60
 DOMAIN = re.compile(r"^[a-z0-9.-]+\.[a-z]{2,}$")
 NAMES = ("Placement test 1 (Nov 2026)", "Placement test 2 (Nov 2026)")
 
@@ -159,14 +161,87 @@ def _placement_ops(ads, ag, domains):
     return ops
 
 
+def quota_kind(e):
+    """'daily' (QuotaError.RESOURCE_EXHAUSTED: the daily operation limit), 'temporary'
+    (short-term rate limits, same gRPC status) or None. Both arrive as gRPC
+    RESOURCE_EXHAUSTED, so the Google Ads error code decides."""
+    if not (isinstance(e, QuotaExhausted) or is_quota_error(e)):
+        return None
+    if isinstance(e, QuotaExhausted) and e.__cause__ is not None:
+        e = e.__cause__                 # the original Google Ads error (from Ads.search)
+    codes = error_codes(e)
+    if any(c in ("RESOURCE_TEMPORARILY_EXHAUSTED",
+                 "EXCESSIVE_SHORT_TERM_QUERY_RESOURCE_CONSUMPTION") for c in codes):
+        return "temporary"
+    if "RESOURCE_EXHAUSTED" in codes:
+        return "daily"
+    text = str(e) + str(getattr(e, "failure", ""))
+    if "TEMPORARILY" in text or "SHORT_TERM" in text:
+        return "temporary"
+    return "daily" if "RESOURCE_EXHAUSTED" in text else "unclassified"
+
+
+def error_codes(e):
+    out = []
+    for err in getattr(getattr(e, "failure", None), "errors", None) or []:
+        try:
+            f = err.error_code._pb.WhichOneof("error_code")
+            out.append(getattr(err.error_code, f).name if f else "")
+        except Exception:
+            pass
+    return out
+
+
+def error_detail(e):
+    if isinstance(e, QuotaExhausted) and e.__cause__ is not None:
+        e = e.__cause__
+    parts = [type(e).__name__]
+    codes = error_codes(e)
+    if codes:
+        parts.append("codes=" + ",".join(codes))
+    msgs = [getattr(x, "message", "") for x in
+            (getattr(getattr(e, "failure", None), "errors", None) or [])]
+    parts.append(short("; ".join(m for m in msgs if m) or str(e), 400))
+    if getattr(e, "request_id", None):
+        parts.append(f"request_id={e.request_id}")
+    return " | ".join(parts)
+
+
+def _wait(w, s):
+    stop = getattr(w, "stop", None)
+    if stop is not None:
+        stop.wait(s)
+    else:
+        time.sleep(s)
+
+
+def _beat(w):
+    hb = getattr(w, "heartbeat", None)
+    if callable(hb):
+        hb()
+
+
 def _send(w, c, ag, domains):
-    """One request, partial failure on. Returns {domain: error} for rejected ones."""
+    """One request, partial failure on. Returns {domain: error} for rejected ones.
+    A short-term rate limit is waited out and the same request sent again (up to
+    TEMP_TRIES times); the daily quota error is raised to the caller."""
     ads = w.ads
     ops = _placement_ops(ads, ag, domains)
-    c["ops"] += len(ops)
-    db.log_ops(w.con, len(ops), KEY)
-    resp = ads.client.get_service("AdGroupCriterionService").mutate_ad_group_criteria(
-        request={"customer_id": ads.cid, "operations": ops, "partial_failure": True})
+    for attempt in range(TEMP_TRIES):
+        c["ops"] += len(ops)                 # counted on every attempt (Google counts
+        db.log_ops(w.con, len(ops), KEY)     # rejected requests too)
+        try:
+            resp = ads.client.get_service("AdGroupCriterionService").mutate_ad_group_criteria(
+                request={"customer_id": ads.cid, "operations": ops, "partial_failure": True})
+            break
+        except Exception as e:
+            if quota_kind(e) != "temporary" or attempt == TEMP_TRIES - 1:
+                raise
+            c.setdefault("rate_limits", []).append(error_detail(e))
+            w.log(f"placement test: short-term rate limit, waiting {TEMP_WAIT_S} s then "
+                  f"sending the same {len(ops)} placements again: {error_detail(e)}")
+            _wait(w, TEMP_WAIT_S)
+    _beat(w)
     failed = ads.partial_failures(resp)
     if None in failed:
         return {d: failed[None] for d in domains}
@@ -180,20 +255,31 @@ def _readback(w, c):
                       f"ad_group.resource_name = {_q(ag)} AND ad_group_criterion.type = "
                       "'PLACEMENT' AND ad_group_criterion.status != 'REMOVED' AND "
                       "ad_group_criterion.negative = FALSE", KEY)
-    g = ads.search("SELECT ad_group.optimized_targeting_enabled, "
-                   "ad_group.targeting_setting.target_restrictions FROM ad_group WHERE "
-                   f"ad_group.resource_name = {_q(ag)}", KEY)
-    c["ops"] += 2
-    tr = [(t.targeting_dimension.name, t.bid_only)
-          for t in g[0].ad_group.targeting_setting.target_restrictions] if g else []
-    plc = [b for d, b in tr if d == "PLACEMENT"]
-    c["readback"] = {
-        "placements_stored": len(rows),
-        "placement_setting": ("Targeting" if plc == [False] else "Observation" if plc == [True]
-                              else f"not stored ({tr})"),
-        "optimized_targeting": g[0].ad_group.optimized_targeting_enabled if g else None,
-        "time": time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())}
+    c["ops"] += 1
+    rb = {"placements_stored": len(rows),
+          "time": time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())}
+    try:                         # settings read-back never blocks the test
+        g = ads.search("SELECT ad_group.optimized_targeting_enabled, "
+                       "ad_group.targeting_setting.target_restrictions FROM ad_group WHERE "
+                       f"ad_group.resource_name = {_q(ag)}", KEY)
+        c["ops"] += 1
+        tr = [(t.targeting_dimension.name, t.bid_only)
+              for t in g[0].ad_group.targeting_setting.target_restrictions] if g else []
+        plc = [b for d, b in tr if d == "PLACEMENT"]
+        rb["placement_setting"] = ("Targeting" if plc == [False] else "Observation"
+                                   if plc == [True] else f"not stored ({tr})")
+        rb["optimized_targeting"] = g[0].ad_group.optimized_targeting_enabled if g else None
+    except Exception as e:
+        if quota_kind(e):
+            raise
+        rb["placement_setting"] = rb["optimized_targeting"] = f"could not read: {short(e, 200)}"
+    c["readback"] = rb
+    _beat(w)
     return {r.ad_group_criterion.placement.url for r in rows}
+
+
+def _now():
+    return time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
 
 
 def run(w):
@@ -202,23 +288,29 @@ def run(w):
     domains = load_domains(w.sheet)
     if not st:
         st = {"articles": pick_articles(con), "domains": len(domains),
-              "worker_ops_24h_at_start": db.ops_last_24h(con),
-              "started": time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime()),
+              "worker_ops_24h_at_start": db.ops_last_24h(con), "started": _now(),
               "c": [{"ops": 0, "rejected": {}} for _ in range(2)]}
         _save(con, st)
         w.log(f"placement test: started with {len(domains)} domains; articles "
               f"{st['articles']}; worker operations in the last 24 h: "
               f"{st['worker_ops_24h_at_start']}")
     logos = ads.upload_logos()
+    stage = None                                 # (campaign index, step) being run
     try:
         for i in range(2):
             c = st["c"][i]
+            if c.get("stopped"):
+                break                            # the daily quota already ran out
             if not c.get("campaign"):
+                stage = (i, "create")
                 _create_campaign(w, st, i, logos)
                 _save(con, st)
-                w.log(f"placement test: campaign {i + 1} created (paused): {c['campaign']}")
+                w.log(f"placement test: campaign {i + 1} created (paused): "
+                      f"{_id(c['campaign'])}")
             if i == 0 and not c.get("placements_done"):
-                if c.get("in_flight"):          # crashed mid-request: read, never resend
+                stage = (0, "placements")
+                c["sent"] = len(domains)
+                if c.get("in_flight"):          # restart mid-request: read, never resend
                     have = _readback(w, c)
                     c["note"] = "restart during the placement request; counted by read-back"
                     c["accepted"] = len(have)
@@ -231,16 +323,25 @@ def run(w):
                     c["accepted"] = len(domains) - len(rej)
                 c["in_flight"] = False
                 c["placements_done"] = True
-                _save(con, st)
-                _readback(w, c)
+                c["result"] = "all placements sent in one request; no quota error"
                 _save(con, st)
                 w.log(f"placement test: campaign 1: {c['accepted']} placements accepted, "
-                      f"{len(c['rejected'])} rejected, read back {c['readback']}")
+                      f"{len(c['rejected'])} rejected")
+            if i == 0 and "readback" not in c:
+                stage = (0, "readback")
+                _readback(w, c)
+                _save(con, st)
+                w.log(f"placement test: campaign 1 read back: {c['readback']}")
             if i == 1 and not c.get("placements_done"):
-                have = _readback(w, c) if c.get("sent") else set()
+                stage = (1, "placements")
+                have = _readback(w, c) if c.get("sending") else set()
+                c.pop("readback", None)
                 c.setdefault("worker_ops_24h_before", db.ops_last_24h(con))
                 todo = [d for d in domains if d not in have and d not in c["rejected"]]
-                c["sent"] = c.get("sent", 0)
+                # after a restart: what Google holds + what it rejected = what got through
+                c["sent"] = len(have) + len(c["rejected"]) if c.get("sending") else 0
+                c["sending"] = True
+                _save(con, st)
                 for k in range(0, len(todo), CHUNK_2):
                     part = todo[k:k + CHUNK_2]
                     rej = _send(w, c, c["adgroup"], part)
@@ -251,34 +352,51 @@ def run(w):
                 c["result"] = "all placements sent; no quota error"
                 _save(con, st)
     except Exception as e:
-        if not (isinstance(e, QuotaExhausted) or is_quota_error(e)):
+        kind = quota_kind(e)
+        if kind is None:
             raise
-        c = st["c"][1] if st["c"][0].get("placements_done") else st["c"][0]
-        c["quota_error"] = short(str(e), 500)
-        c["quota_error_time"] = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
+        i, step = stage or (0, "start")
+        c = st["c"][i]
+        c["quota_error"] = f"{kind}: {error_detail(e)}"
+        c["quota_error_time"] = _now()
+        c["quota_error_step"] = step
         c["worker_ops_24h_at_error"] = db.ops_last_24h(con)
-        c["placements_done"] = True
-        c["result"] = "stopped by Google's quota error"
         _save(con, st)
-        w.log(f"placement test: QUOTA ERROR on campaign {st['c'].index(c) + 1} after "
-              f"{c.get('sent', c.get('accepted', 0))} placements sent: {c['quota_error']}")
-        db.kv_set(con, "quota_wait_until", time.time() + 3600)
-    # final read-back of campaign 2 (needs quota; retried every loop until it works)
-    c2 = st["c"][1]
-    if c2.get("adgroup") and "readback" not in c2:
-        try:
-            _readback(w, c2)
-        except Exception as e:
-            if isinstance(e, QuotaExhausted) or is_quota_error(e):
+        w.log(f"placement test: Google Ads limit ({kind}) on campaign {i + 1}, step {step}, "
+              f"after {c.get('sent', 0)} placements sent: {c['quota_error']}")
+        if kind == "daily" and step in ("create", "placements"):
+            c["placements_done"] = True
+            c["stopped"] = True
+            c["result"] = f"stopped by Google's daily quota error ({step})"
+            _save(con, st)
+            db.kv_set(con, "quota_wait_until", time.time() + 3600)
+        else:
+            # read-back hit the limit, or a rate limit outlasted the retries: carry on later
+            db.kv_set(con, "quota_wait_until", time.time() + (3600 if kind == "daily" else 300))
+            write_report(w, st)
+            return
+    # final read-backs (need quota; retried every loop until they work)
+    for c in st["c"]:
+        if c.get("adgroup") and "readback" not in c:
+            try:
+                _readback(w, c)
                 _save(con, st)
-                write_report(w, st)
-                return                  # read back later, when the quota allows
-            raise
+            except Exception as e:
+                if quota_kind(e):
+                    _save(con, st)
+                    write_report(w, st)
+                    return              # read back later, when the quota allows
+                raise
     st["done"] = True
-    st["finished"] = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
+    st["finished"] = _now()
     _save(con, st)
     write_report(w, st)
     w.log("placement test: finished; see the 'Placement test' tab")
+
+
+def _id(res):
+    """Last part of a resource name only: the account ID never goes into the Sheet/logs."""
+    return str(res).rsplit("/", 1)[-1] if res else res
 
 
 def report_rows(st):
@@ -290,7 +408,7 @@ def report_rows(st):
              st.get("worker_ops_24h_at_start")]]
     for n, c in ((1, c1), (2, c2)):
         rb = c.get("readback", {})
-        rows += [[f"Campaign {n}", c.get("campaign") or "not created"],
+        rows += [[f"Campaign {n} ID", _id(c.get("campaign")) or "not created"],
                  [f"Campaign {n}: operations sent (worker's count)", c.get("ops")],
                  [f"Campaign {n}: worker operations in the 24 h before its placements",
                   c.get("worker_ops_24h_before")],
@@ -299,6 +417,10 @@ def report_rows(st):
                  [f"Campaign {n}: result", c.get("result", "done" if c.get("placements_done")
                                                  else "not run")],
                  [f"Campaign {n}: quota error", c.get("quota_error", "none")],
+                 [f"Campaign {n}: quota error step / time",
+                  f"{c.get('quota_error_step', '')} {c.get('quota_error_time', '')}".strip()],
+                 [f"Campaign {n}: short-term rate limits waited out",
+                  len(c.get("rate_limits", []))],
                  [f"Campaign {n}: worker operations in the 24 h at the quota error",
                   c.get("worker_ops_24h_at_error", "")],
                  [f"Campaign {n}: placements stored (read back)",
@@ -323,5 +445,8 @@ def write_report(w, st):
         w.sheet.write(TAB_OUT, report_rows(st), force=True)
     except Exception as e:
         w.log(f"placement test: report not written: {e}")
-    w.log("placement test report: " + json.dumps(
-        {k: v for k, v in st.items() if k != "articles"}, default=str)[:3000])
+    safe = {k: v for k, v in st.items() if k not in ("articles", "c")}
+    safe["c"] = [{k: (_id(v) if k in ("budget", "campaign", "adgroup") else v)
+                  for k, v in c.items() if k != "rejected"} | {"rejected": len(c.get("rejected", {}))}
+                 for c in st["c"]]
+    w.log("placement test report: " + json.dumps(safe, default=str)[:3000])

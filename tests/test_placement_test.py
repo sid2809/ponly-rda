@@ -15,9 +15,20 @@ NS = types.SimpleNamespace
 
 
 class GoogleAdsException(Exception):           # same class name the pipeline checks for
-    def __init__(self):
-        super().__init__("RESOURCE_EXHAUSTED: Too many requests")
+    """Like Google's: gRPC RESOURCE_EXHAUSTED for both the daily quota and short-term rate
+    limits; only the Google Ads error code tells them apart."""
+
+    def __init__(self, client, code="RESOURCE_EXHAUSTED"):
+        super().__init__("RESOURCE_EXHAUSTED")
         self.error = NS(code=lambda: NS(name="RESOURCE_EXHAUSTED"))
+        from google.ads.googleads.v26.errors.types import quota_error
+        f = client.get_type("GoogleAdsFailure")
+        e = client.get_type("GoogleAdsError")
+        e.error_code.quota_error = getattr(quota_error.QuotaErrorEnum.QuotaError, code)
+        e.message = "Too many requests."
+        f.errors.append(e)
+        self.failure = f
+        self.request_id = "req1"
 
 
 class Google:
@@ -33,10 +44,15 @@ class Google:
         self.targeting = {}          # ad group -> [(dimension, bid_only)]
         self.optimized = {}
         self.creates = 0
+        self.temp_errors = 0
+        self.search_fail = 0
 
     def charge(self, n):
+        if self.temp_errors:
+            self.temp_errors -= 1
+            raise GoogleAdsException(self.client, "RESOURCE_TEMPORARILY_EXHAUSTED")
         if self.used + n > self.limit:
-            raise GoogleAdsException()
+            raise GoogleAdsException(self.client)
         self.used += n
 
     def _res(self, coll):
@@ -100,6 +116,9 @@ class Google:
         return NS(results=results, partial_failure_error=pfe)
 
     def search(self, q):
+        if self.search_fail:
+            self.search_fail -= 1
+            raise GoogleAdsException(self.client)
         self.charge(1)
         m = re.search(r"campaign\.name = '([^']+)'", q)
         if m:
@@ -164,7 +183,7 @@ def setup(tmp, limit, n_domains=9405, reject=()):
                 return g.search(query)
             except GoogleAdsException as e:
                 from rda.gads import QuotaExhausted
-                raise QuotaExhausted(str(e))
+                raise QuotaExhausted(str(e)) from e
 
     ads = TAds(con, client)
     ads.cid = "1"
@@ -197,7 +216,7 @@ def test_counts_one_per_placement_stops_campaign_2_and_reads_back_later():
         assert c1["readback"] == {**c1["readback"], "placements_stored": 9404,
                                   "placement_setting": "Targeting",
                                   "optimized_targeting": False}
-        assert c2["result"] == "stopped by Google's quota error"
+        assert c2["result"] == "stopped by Google's daily quota error (placements)"
         assert 4000 < c2["sent"] < 6000                  # 15,000 - c1 (~9,430) in 500s
         assert c2["readback"]["placements_stored"] == c2["sent"] - len(c2["rejected"])
         # read-back while the quota is still used up: waits, then reads later
@@ -211,7 +230,9 @@ def test_counts_one_per_placement_stops_campaign_2_and_reads_back_later():
         st = db.kv_get(w.con, pt.KEY)
         assert st["done"] and st["c"][1]["readback"]["placements_stored"] == st["c"][1]["sent"] - 1
         rows = dict((r[0], r[1]) for r in w.sheet.tabs["Placement test"] if len(r) == 2)
-        assert rows["Campaign 2: result"] == "stopped by Google's quota error"
+        assert rows["Campaign 2: result"] == "stopped by Google's daily quota error (placements)"
+        assert "customers/" not in json.dumps(w.sheet.tabs["Placement test"])
+        assert not any("customers/" in str(x) for x in logs)
         assert ["site7.com", "not a valid placement"] in w.sheet.tabs["Placement test"]
         assert g.creates == 2
 
@@ -269,3 +290,72 @@ def test_bad_placements_tab_stops_before_anything_is_created():
 def test_runs_only_when_ticked_and_not_done():
     w = NS(settings={"Run placement test": False}, s_bool=lambda k: False, con=None)
     assert not pt.wanted(w)
+
+
+def test_short_term_rate_limit_is_waited_out_not_reported_as_quota():
+    with tempfile.TemporaryDirectory() as tmp:
+        w, g, domains, logs = setup(tmp, limit=10 ** 9, n_domains=1200)
+        pt.TEMP_WAIT_S = 0
+        orig = g.mutate_ad_group_criteria
+
+        def flaky(request):
+            if len(request["operations"]) == 500 and not getattr(flaky, "done", False):
+                flaky.done = True
+                g.temp_errors = 1
+            return orig(request)
+        g.mutate_ad_group_criteria = flaky
+        pt.run(w)
+        st = db.kv_get(w.con, pt.KEY)
+        c2 = st["c"][1]
+        assert st["done"] and c2["result"] == "all placements sent; no quota error"
+        assert len(c2["rate_limits"]) == 1 and "quota_error" not in c2
+        assert c2["readback"]["placements_stored"] == 1200
+
+
+def test_quota_error_on_campaign_1_read_back_does_not_skip_campaign_2():
+    with tempfile.TemporaryDirectory() as tmp:
+        w, g, domains, logs = setup(tmp, limit=10 ** 9, n_domains=600)
+        orig = pt._readback
+        calls = {"n": 0}
+
+        def rb(w_, c):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                g.search_fail = 1               # daily quota error on the first read-back
+            return orig(w_, c)
+        pt._readback = rb
+        try:
+            pt.run(w)                            # stops at the read-back, nothing marked
+            st = db.kv_get(w.con, pt.KEY)
+            assert not st["c"][1].get("campaign") and not st["c"][1].get("stopped")
+            pt.run(w)                            # later: read-back, then campaign 2
+        finally:
+            pt._readback = orig
+        st = db.kv_get(w.con, pt.KEY)
+        assert st["done"] and st["c"][1]["readback"]["placements_stored"] == 600
+
+
+def test_restart_during_campaign_2_never_sends_a_placement_twice():
+    with tempfile.TemporaryDirectory() as tmp:
+        w, g, domains, logs = setup(tmp, limit=10 ** 9, n_domains=1600)
+        orig = pt._send
+        n = {"c2": 0}
+
+        def send(w_, c, ag, part):
+            if len(part) == 500:
+                n["c2"] += 1
+                if n["c2"] == 2:
+                    orig(w_, c, ag, part)        # Google applies it, then the worker dies
+                    raise RuntimeError("crash")
+            return orig(w_, c, ag, part)
+        pt._send = send
+        try:
+            pt.run(w)
+        except RuntimeError:
+            pass
+        pt._send = orig
+        pt.run(w)
+        st = db.kv_get(w.con, pt.KEY)
+        ag2 = [a for a in g.placements if a != list(g.placements)[0]][0]
+        assert len(g.placements[ag2]) == len(set(g.placements[ag2])) == 1600
+        assert st["done"] and st["c"][1]["sent"] == 1600
