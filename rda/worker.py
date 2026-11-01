@@ -1207,6 +1207,9 @@ class Worker:
             self.run_step("recover", self.recover)
             self.run_step("poll_images", self.poll_images, backoff=False)
             self.read_settings()
+            from . import placement_test             # one-off test (Siddharth, 1 Nov)
+            if placement_test.wanted(self):
+                self.run_step("placement_test", placement_test.run, self)
             if self.paused():
                 return
             if not db.kv_get(self.con, "pilot_rerun_done"):

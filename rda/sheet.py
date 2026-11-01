@@ -25,6 +25,9 @@ SETTINGS_DEFAULTS = [
     ["Articles per ad group (min)", 2, "Same-theme articles are kept together"],
     ["Articles per ad group (max)", 4, ""],
     ["Pause", True, "Ticked = worker paused (nothing new is started). Untick to run."],
+    ["Run placement test", False, "Type TRUE to run the one-off placement quota test "
+                                  "(2 paused campaigns; domains from the 'Placements' tab). "
+                                  "Runs once."],
 ]
 OUTPUT_HEADER = ["ID", "Category", "Title", "Final URL", "Alcohol", "Alcohol reason", "Wave",
                  "Image model", "Campaign", "Ad group", "Status", "Error / skip reason",
@@ -88,6 +91,13 @@ class Sheet:
             spreadsheetId=self.sid, range="'Input'!A1:C1")).get("values", [])
         if not head:   # only the first row is read, not the whole tab
             self.write("Input", [["URL", "Title", "Category"]], force=True)
+
+    def ensure_tab(self, title):
+        meta = self._call(self.svc.spreadsheets().get(spreadsheetId=self.sid))
+        if title not in {s["properties"]["title"] for s in meta["sheets"]}:
+            self._call(self.svc.spreadsheets().batchUpdate(
+                spreadsheetId=self.sid, body={"requests": [{"addSheet": {"properties": {
+                    "title": title}}}]}))
 
     def read(self, tab):
         r = self._call(self.svc.spreadsheets().values().get(
