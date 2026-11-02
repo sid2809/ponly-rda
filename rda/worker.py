@@ -1230,6 +1230,10 @@ class Worker:
                   count("SELECT COUNT(*) FROM campaigns WHERE status='held' OR (status='created' "
                         "AND error LIKE 'not enabled%')")],
                  ["Ad groups with all topics / created (topic waves)", self._topic_counts()],
+                 ["Campaigns with desktop + TV screens opted out (confirmed in Google Ads) / all",
+                  f"{count('SELECT COUNT(*) FROM campaigns WHERE devices_ok IS NOT NULL AND status NOT IN (?,?)', 'removed', 'failed')}"
+                  f" / {count('SELECT COUNT(*) FROM campaigns WHERE campaign_res IS NOT NULL AND status NOT IN (?,?)', 'removed', 'failed')}"
+                  f"; failed 3 times: {count('SELECT COUNT(*) FROM campaigns WHERE devices_ok IS NULL AND device_attempts>=3')}"],
                  ["Wave 2 copy written again ('Best ... (Recipe) YEAR' allowed)",
                   json.dumps({k: v for k, v in db.kv_get(con, "recopy_2", {}).items()
                               if k not in ("todo", "problems")})],
@@ -1346,6 +1350,7 @@ class Worker:
                     self.run_step(f"{name}:w{w}", fn, w)
             if ads_ok:
                 self.run_step("labels", lambda: self.ads.add_missing_labels())
+                self.run_step("devices", lambda: self.ads.ensure_devices())
         finally:
             # read-only: keeps approvals, clicks and cost current even while paused
             self.run_step("sync", self.step_sync)

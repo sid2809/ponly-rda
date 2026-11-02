@@ -12,6 +12,7 @@ def drive(ads, logos, rounds=6):
     wave = ads.con.execute("SELECT wave FROM campaigns").fetchone()[0]
     for _ in range(rounds):
         ads.run_upload(wave, logos, 10000)
+    ads.ensure_devices()
 
 
 def test_wave_2_ad_groups_get_the_three_topics_as_targeting_once():

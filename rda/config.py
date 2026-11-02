@@ -57,6 +57,9 @@ ADGROUP_MIN, ADGROUP_MAX = 2, 4
 # by these paths at upload time; nothing is guessed.
 TOPIC_PATHS = [("Food & Drink", "Beverages"), ("Food & Drink", "Food"),
                ("Food & Drink", "Cooking & Recipes")]
+# Siddharth 2 Nov 2026: ads show on phones and tablets only. Desktop and TV screens are opted
+# out (bid adjustment -100%, i.e. bid_modifier 0) on every campaign, the pilot included.
+DEVICES_OPT_OUT = ("DESKTOP", "CONNECTED_TV")
 # Wave 1 is the live pilot: its ad groups are left exactly as they are (not decided yet).
 TOPICS_SKIP_WAVES = (1,)
 GEO_US = "geoTargetConstants/2840"

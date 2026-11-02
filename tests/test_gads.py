@@ -48,6 +48,9 @@ class Stub:
         self.removed = set()          # removed campaigns/budgets stay, like in Google Ads
         self.asset_disapproved = set()
         self.ag_targeting = {}
+        self.dev = {}                # (campaign, device) -> [criterion resource, bid_modifier]
+        self.dev_implicit = False    # True: campaigns come with device criteria (no modifier)
+        self.dev_calls = 0
 
     # ---- batch jobs
     def mutate_batch_job(self, customer_id, operation):
@@ -188,6 +191,35 @@ class Stub:
             out.append(NS(resource_name=op.remove))
         return NS(results=out, partial_failure_error=None)
 
+    def _devices_of(self, camp):
+        if self.dev_implicit:
+            for i, d in enumerate(("MOBILE", "TABLET", "DESKTOP", "CONNECTED_TV")):
+                self.dev.setdefault((camp, d), [f"{camp.replace('campaigns', 'campaignCriteria')}"
+                                                f"~3000{i}", None])
+
+    def mutate_campaign_criteria(self, request):
+        """Device opt-out. Like Google: an update only changes fields named in update_mask."""
+        self.dev_calls += 1
+        results = []
+        for op in request["operations"]:
+            if op._pb.HasField("create"):
+                c = op.create
+                key = (c.campaign, c.device.type_.name)
+                self._devices_of(c.campaign)
+                if key in self.dev:
+                    raise AssertionError("device criterion already exists: must update")
+                self.n += 1
+                self.dev[key] = [f"customers/1/campaignCriteria/{self.n}",
+                                 c.bid_modifier if "bid_modifier" in c else None]
+                results.append(NS(resource_name=self.dev[key][0]))
+            else:
+                u = op.update
+                key = next(k for k, v in self.dev.items() if v[0] == u.resource_name)
+                if "bid_modifier" in list(op.update_mask.paths):
+                    self.dev[key][1] = u.bid_modifier
+                results.append(NS(resource_name=u.resource_name))
+        return NS(results=results, partial_failure_error=None)
+
     def mutate_campaigns(self, request):
         out, bad = [], []
         if request["operations"] and request["operations"][0].remove:
@@ -239,6 +271,23 @@ class Stub:
         if frm == "campaign":
             return [NS(campaign=NS(name=n, resource_name=r)) for n, r in e["campaign"]
                     if keep(n, r) or keep(r, r)]
+        if frm == "campaign_criterion" and "type = 'DEVICE'" in query:
+            from google.ads.googleads.v26.resources.types import campaign_criterion as ccm
+            out = []
+            for (c, d), (r, bm) in list(self.dev.items()) + []:
+                if not keep(c):
+                    continue
+                cc = ccm.CampaignCriterion(resource_name=r)
+                cc.device.type_ = d
+                if bm is not None:
+                    cc.bid_modifier = bm
+                out.append(NS(campaign=NS(resource_name=c), campaign_criterion=cc))
+            if self.dev_implicit:
+                for c, n, r in [(None, n, r) for n, r in self.ent["campaign"]]:
+                    if keep(r) and not any(k[0] == r for k in self.dev):
+                        self._devices_of(r)
+                        return self.search(query)
+            return out
         if frm == "campaign_criterion":
             return [NS(campaign=NS(resource_name=c), campaign_criterion=NS(
                 resource_name=r, type_=NS(name=t))) for c, t, r in e["crit"] if keep(c)]
@@ -339,6 +388,7 @@ def setup(tmp, fail_types=(), n_articles=4, wave=1):
 def drive(ads, logos, rounds=6):
     for _ in range(rounds):
         ads.run_upload(1, logos, 10000)
+    ads.ensure_devices()             # the worker runs this every loop
 
 
 def uploaded(con):

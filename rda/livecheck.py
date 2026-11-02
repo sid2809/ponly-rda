@@ -151,6 +151,12 @@ def run(w):
                 ags.setdefault((x.campaign.resource_name, x.ad_group.name), []).append(
                     x.ad_group.resource_name)
         dup += [f"{t} criterion x{v} on {r}" for (r, t), v in crit.items() if v > 1]
+        dstate = ads.device_state(res)
+        for c in camps:
+            if c.get("devices_ok") and not ads.devices_opted_out(dstate, c["campaign_res"]):
+                mism.append(f"{c['name']}: desktop / TV screens no longer opted out in Google Ads")
+            elif not c.get("devices_ok"):
+                pending.append(f"{c['name']}: devices")
         for c in camps:
             for t in ("LOCATION", "LANGUAGE"):
                 if not crit.get((c["campaign_res"], t)):
@@ -242,7 +248,7 @@ def run(w):
         dup += [f"image asset '{k}' x{v}" for k, v in acnt.items() if v > 1]
         summary = (f"{len(camps)} campaigns, {len(ags)} ad groups, {len(all_ads)} ads checked; "
                    f"duplicates: {dup[:20] or 'none'}; mismatches: {mism[:20] or 'none'}; "
-                   f"labels still to be added by the worker: {len(pending)} campaigns "
+                   f"labels / device opt-out still to be done by the worker: {len(pending)} "
                    f"{pending[:3] if pending else ''}")
         return not dup and not mism, summary
 

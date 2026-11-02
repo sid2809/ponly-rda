@@ -202,6 +202,90 @@ class Ads:
             "WHERE g.campaign_key=? ORDER BY a.category", (c["key"],))]
         return [config.BRAND_LABEL, "ALCOHOL"] + cats + model
 
+    # ---------- devices (phones + tablets only) ----------
+    def device_state(self, camp_res):
+        """{(campaign, device): (criterion resource, bid_modifier or None)} from Google."""
+        out = {}
+        for part in _chunks(camp_res):
+            q = ",".join(_q(r) for r in part)
+            for x in self.search("SELECT campaign.resource_name, campaign_criterion.resource_name, "
+                                 "campaign_criterion.device.type, campaign_criterion.bid_modifier "
+                                 f"FROM campaign_criterion WHERE campaign.resource_name IN ({q}) "
+                                 "AND campaign_criterion.type = 'DEVICE'", "devices"):
+                cc = x.campaign_criterion
+                bm = cc.bid_modifier if "bid_modifier" in cc else None
+                out[(x.campaign.resource_name, cc.device.type_.name)] = (cc.resource_name, bm)
+        return out
+
+    @staticmethod
+    def devices_opted_out(state, camp):
+        """True when every device in config.DEVICES_OPT_OUT has bid_modifier 0 in Google."""
+        return all(state.get((camp, d), (None, None))[1] == 0
+                   for d in config.DEVICES_OPT_OUT)
+
+    def ensure_devices(self):
+        """Opt desktop and TV screens out (bid_modifier 0) on every campaign of ours that has
+        not been confirmed yet, pilot included. Reads first, updates criteria that exist and
+        creates the ones that do not, then reads back: only a read-back with 0 counts.
+        Up to 3 tries per campaign; enabling is refused until confirmed (pre_enable_check)."""
+        con = self.con
+        rows = [dict(r) for r in con.execute(
+            "SELECT * FROM campaigns WHERE campaign_res IS NOT NULL AND status NOT IN "
+            "('removed','failed') AND devices_ok IS NULL AND COALESCE(device_attempts,0)<3")]
+        if not rows:
+            return 0
+        camps = [r["campaign_res"] for r in rows]
+        state = self.device_state(camps)
+        ops, idx = [], []
+        for r in rows:
+            c = r["campaign_res"]
+            for d in config.DEVICES_OPT_OUT:
+                res, bm = state.get((c, d), (None, None))
+                if bm == 0:
+                    continue
+                op = self.client.get_type("CampaignCriterionOperation")
+                if res:
+                    op.update.resource_name = res
+                    op.update.bid_modifier = 0.0
+                    # explicit mask: the standard helper drops a field whose value is 0
+                    op.update_mask.paths.append("bid_modifier")
+                else:
+                    op.create.campaign = c
+                    op.create.device.type_ = getattr(self.e.DeviceEnum, d)
+                    op.create.bid_modifier = 0.0
+                ops.append(op)
+                idx.append((r, d))
+        errors = {}
+        svc = self.client.get_service("CampaignCriterionService")
+        for i in range(0, len(ops), 2000):
+            part, pidx = ops[i:i + 2000], idx[i:i + 2000]
+            resp = svc.mutate_campaign_criteria(request={
+                "customer_id": self.cid, "operations": part, "partial_failure": True})
+            db.log_ops(con, len(part), "devices")
+            failed = self.partial_failures(resp)
+            for j, (r, d) in enumerate(pidx):
+                err = failed.get(j) or failed.get(None)
+                if err:
+                    errors.setdefault(r["key"], []).append(f"{d}: {err}")
+        state = self.device_state(camps)                # only Google's answer counts
+        done = 0
+        with db.tx(con):
+            for r in rows:
+                if self.devices_opted_out(state, r["campaign_res"]):
+                    con.execute("UPDATE campaigns SET devices_ok=?, device_error=NULL WHERE key=?",
+                                (time.time(), r["key"]))
+                    done += 1
+                    db._log_after_commit(con, f"devices: campaign {r['name']}: desktop and TV "
+                                              f"screens opted out (read back from Google Ads)")
+                else:
+                    n = (r["device_attempts"] or 0) + 1
+                    why = "; ".join(errors.get(r["key"], [])) or "not 0 in Google Ads after the change"
+                    con.execute("UPDATE campaigns SET device_attempts=?, device_error=? WHERE key=?",
+                                (n, f"devices: {why}"[:500], r["key"]))
+                    db._log_after_commit(con, f"devices FAILED ({n}/3): campaign {r['name']}: "
+                                              f"{short(why, 300)}")
+        return done
+
     def add_missing_labels(self):
         """Labels wanted on campaigns of waves already uploaded but not applied yet (e.g. a
         label added later, like the image model). Never touches anything else."""
@@ -1228,6 +1312,10 @@ class Ads:
         for r in rows:
             if not ads_n.get(r["key"]):
                 hold.setdefault(r["key"], "no ads uploaded in this campaign")
+        dstate = self.device_state([r["campaign_res"] for r in rows if r["campaign_res"]])
+        for r in rows:
+            if r["campaign_res"] and not self.devices_opted_out(dstate, r["campaign_res"]):
+                hold.setdefault(r["key"], "desktop / TV screens not opted out in Google Ads yet")
         by_name = {}
         names = [r["name"] for r in rows]
         for part in _chunks(names):
