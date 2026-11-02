@@ -19,9 +19,10 @@ def current_year():
 
 
 def best_pattern(headline, title, year):
-    """Siddharth 2 Nov 2026: the one place 'Best' and the year are allowed is a headline of
-    exactly 'Best [dish] Recipe YEAR', where every word of [dish] is in the title."""
-    m = re.fullmatch(rf"Best (.+) Recipe {year}", headline.strip(), re.IGNORECASE)
+    """Siddharth 2 Nov 2026: the only places 'Best' and the year are allowed are headlines of
+    exactly 'Best [dish] Recipe YEAR' or 'Best [dish] YEAR', where every word of [dish] is in
+    the title."""
+    m = re.fullmatch(rf"Best (.+?)(?: Recipe)? {year}", headline.strip(), re.IGNORECASE)
     if not m:
         return False
     dish = re.findall(r"[a-z]+", m.group(1).lower())
@@ -64,7 +65,8 @@ def check_copy(copy, title, year=None):
         low = text.lower()
         allowed = i in pattern                       # 'Best ... Recipe YEAR' headline
         if _BEST.search(low) and not allowed and not title_best:
-            p.append(f"'best' only in a 'Best [dish] Recipe {year}' headline: {text!r}")
+            p.append(f"'best' only in a 'Best [dish] Recipe {year}' or 'Best [dish] {year}' "
+                     f"headline: {text!r}")
         for c in CLICKBAIT:
             if re.search(r"(?<![a-z])" + re.escape(c) + r"(?![a-z])", low) and c not in title.lower():
                 p.append(f"clickbait phrase {c!r}")

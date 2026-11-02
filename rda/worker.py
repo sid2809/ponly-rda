@@ -1230,7 +1230,7 @@ class Worker:
                   count("SELECT COUNT(*) FROM campaigns WHERE status='held' OR (status='created' "
                         "AND error LIKE 'not enabled%')")],
                  ["Ad groups with all topics / created (topic waves)", self._topic_counts()],
-                 ["Wave 2 copy written again ('Best ... Recipe YEAR' allowed)",
+                 ["Wave 2 copy written again ('Best ... (Recipe) YEAR' allowed)",
                   json.dumps({k: v for k, v in db.kv_get(con, "recopy_2", {}).items()
                               if k not in ("todo", "problems")})],
                  ["Ad review status (count)", json.dumps({r[0] or "-": r[1] for r in con.execute(

@@ -36,8 +36,23 @@ def test_pattern_needs_title_words_only():
     assert any("'best' only" in x for x in p) and any("2026" in x for x in p)
 
 
+def test_short_form_best_dish_year_passes():
+    assert lint.check_copy(copy_with(headlines=(2, "Best Pumpkin Gumbo 2026")), T, year=2026) == []
+    assert lint.check_copy(copy_with(headlines=(2, "Best Spiced Gumbo 2026")), T, year=2026) == []
+    p = lint.check_copy(copy_with(headlines=(2, "Best Easy Gumbo 2026")), T, year=2026)
+    assert any("'best' only" in x for x in p)                 # 'Easy' is not in the title
+    assert lint.check_copy(copy_with(headlines=(2, "Best Pumpkin Gumbo 2025")), T, year=2026)
+
+
+def test_both_forms_in_one_ad():
+    c = copy_with(headlines=(3, "Best Pumpkin Gumbo 2026"))
+    assert lint.check_copy(c, T, year=2026) == []
+
+
 def test_best_or_year_anywhere_else_fails():
-    assert lint.check_copy(copy_with(headlines=(2, "Best Pumpkin Gumbo 2026")), T, year=2026)
+    assert lint.check_copy(copy_with(headlines=(2, "2026 Best Pumpkin Gumbo")), T, year=2026)
+    assert lint.check_copy(copy_with(headlines=(2, "Best Pumpkin Gumbo Dish 2026")), T,
+                           year=2026)                    # 'Dish' not in the title
     assert lint.check_copy(copy_with(headlines=(2, "Best Pumpkin Gumbo")), T, year=2026)
     assert lint.check_copy(copy_with(descriptions=(0, "The best pumpkin gumbo recipe.")), T,
                            year=2026)
@@ -66,7 +81,8 @@ def test_best_in_title_still_allowed_like_before():
 
 def test_prompt_explains_the_pattern_with_the_year():
     text = llm.copy_params(T, "Soups", "Theme", year=2026)["messages"][0]["content"]
-    assert '"Best [dish] Recipe 2026"' in text and "fits in 30 characters" in text
+    assert '"Best [dish] Recipe 2026"' in text and '"Best [dish] 2026"' in text
+    assert "fits in 30 characters" in text
 
 
 def _wave2(w, statuses):
