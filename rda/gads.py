@@ -286,6 +286,73 @@ class Ads:
                                               f"{short(why, 300)}")
         return done
 
+    # ---------- final URL of ads already in Google Ads (/cook/ -> /cooks/) ----------
+    @staticmethod
+    def ad_path(ad_group_ad_res):
+        """customers/C/adGroupAds/AG~AD -> customers/C/ads/AD"""
+        cust = ad_group_ad_res.split("/adGroupAds/")[0]
+        return f"{cust}/ads/{ad_group_ad_res.rsplit('~', 1)[1]}"
+
+    def update_final_urls(self):
+        """Siddharth 2 Nov 2026: ads already uploaded (the pilot) get the new final URL
+        (config.rewrite_url). Updated in place through AdService (mask: final_urls only),
+        then read back from Google: only a read-back showing exactly the new URL counts, and
+        only then is the stored URL changed. Up to 3 tries per ad; failures are logged with
+        Google's message and listed in the Summary."""
+        con = self.con
+        rows = [dict(r) for r in con.execute(
+            "SELECT * FROM articles WHERE ad_resource IS NOT NULL AND status='uploaded' AND "
+            "final_url IS NOT NULL AND COALESCE(url_attempts,0)<3")]
+        rows = [r for r in rows if config.rewrite_url(r["final_url"]) != r["final_url"]]
+        if not rows:
+            return 0
+        errors = {}
+        svc = self.client.get_service("AdService")
+        for i in range(0, len(rows), 1000):
+            part = rows[i:i + 1000]
+            ops = []
+            for r in part:
+                op = self.client.get_type("AdOperation")
+                op.update.resource_name = self.ad_path(r["ad_resource"])
+                op.update.final_urls.append(config.rewrite_url(r["final_url"]))
+                op.update_mask.paths.append("final_urls")
+                ops.append(op)
+            resp = svc.mutate_ads(request={"customer_id": self.cid, "operations": ops,
+                                           "partial_failure": True})
+            db.log_ops(con, len(ops), "ad_urls")
+            failed = self.partial_failures(resp)
+            for j, r in enumerate(part):
+                err = failed.get(j) or failed.get(None)
+                if err:
+                    errors[r["id"]] = err
+        now = {}
+        for part in _chunks([r["ad_resource"] for r in rows]):
+            q = ",".join(_q(x) for x in part)
+            for x in self.search("SELECT ad_group_ad.resource_name, ad_group_ad.ad.final_urls "
+                                 f"FROM ad_group_ad WHERE ad_group_ad.resource_name IN ({q})",
+                                 "ad_urls"):
+                now[x.ad_group_ad.resource_name] = list(x.ad_group_ad.ad.final_urls)
+        done = 0
+        with db.tx(con):
+            for r in rows:
+                new = config.rewrite_url(r["final_url"])
+                if now.get(r["ad_resource"]) == [new]:
+                    con.execute("UPDATE articles SET final_url=?, url_error=NULL WHERE id=?",
+                                (new, r["id"]))
+                    done += 1
+                else:
+                    n = (r["url_attempts"] or 0) + 1
+                    why = errors.get(r["id"]) or (f"Google Ads still shows "
+                                                  f"{now.get(r['ad_resource'])}")
+                    con.execute("UPDATE articles SET url_attempts=?, url_error=? WHERE id=?",
+                                (n, f"final URL: {why}"[:500], r["id"]))
+                    db._log_after_commit(con, f"final URL update FAILED ({n}/3): ad "
+                                              f"{r['ad_id']} '{short(r['title'], 50)}': "
+                                              f"{short(why, 300)}")
+        log(f"final URLs of uploaded ads: {done} of {len(rows)} now on the new URL (read back "
+            f"from Google Ads); {len(rows) - done} not yet")
+        return done
+
     def add_missing_labels(self):
         """Labels wanted on campaigns of waves already uploaded but not applied yet (e.g. a
         label added later, like the image model). Never touches anything else."""

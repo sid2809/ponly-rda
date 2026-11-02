@@ -84,3 +84,59 @@ def test_a_busy_wave_never_blocks_another_wave(tmp):
     w.step_fix_urls()
     assert url(w, "a2") == "https://ponly.com/cooks/a2/"   # wave 2 still updated
     assert url(w, "a3") == "https://ponly.com/cook/a3/"    # wave 3 waits for its job
+
+
+# ---------- uploaded (pilot) ads: final URL updated in place, confirmed by read-back ----------
+def _uploaded(tmp_):
+    from tests.test_gads import setup
+    con, ads, stub, logos = setup(tmp_)
+    con.execute("UPDATE articles SET final_url='https://ponly.com/cook/'||id||'/'")
+    for _ in range(4):
+        ads.run_upload(1, logos, 10000)
+    assert all(u.startswith("https://ponly.com/cook/") for _, u, _ in stub.ent["ad"])
+    return con, ads, stub, logos
+
+
+def test_live_ads_get_the_new_url_and_the_stored_url_follows_googles_read_back():
+    import tempfile
+    with tempfile.TemporaryDirectory() as t:
+        con, ads, stub, logos = _uploaded(t)
+        assert ads.update_final_urls() == 4
+        assert all(u.startswith("https://ponly.com/cooks/") for _, u, _ in stub.ent["ad"])
+        assert all(r[0].startswith("https://ponly.com/cooks/") for r in
+                   con.execute("SELECT final_url FROM articles WHERE status='uploaded'"))
+        n = stub.ad_updates
+        assert ads.update_final_urls() == 0 and stub.ad_updates == n      # done once
+
+
+def test_update_google_ignores_is_never_counted_and_stops_after_3():
+    import tempfile
+    with tempfile.TemporaryDirectory() as t:
+        con, ads, stub, logos = _uploaded(t)
+        stub.ignore_ad_updates = True
+        for _ in range(5):
+            ads.update_final_urls()
+        rows = con.execute("SELECT final_url, url_attempts, url_error FROM articles WHERE "
+                           "status='uploaded'").fetchall()
+        assert all(r["final_url"].startswith("https://ponly.com/cook/") for r in rows)
+        assert all(r["url_attempts"] == 3 and "still shows" in r["url_error"] for r in rows)
+        assert stub.ad_updates == 3
+
+
+def test_live_check_lists_pending_urls_and_flags_a_url_that_differs():
+    import tempfile
+    from rda import livecheck
+    from tests.test_gads import _live_worker
+    with tempfile.TemporaryDirectory() as t:
+        con, ads, stub, logos = _uploaded(t)
+        w = _live_worker(con, ads)
+        livecheck.run(w)
+        line = next(x for x in w.logs if "duplicates / mismatches" in x)
+        assert "mismatches: none" in line and ": URL" in line          # pending, not a failure
+        ads.update_final_urls()
+        g, u, r = stub.ent["ad"][0]
+        stub.ent["ad"][0] = (g, "https://ponly.com/cook/changed-back/", r)
+        w = _live_worker(con, ads)
+        livecheck.run(w)
+        line = next(x for x in w.logs if "duplicates / mismatches" in x)
+        assert "FAIL" in line and "differs from stored" in line

@@ -231,6 +231,15 @@ def run(w):
             mism.append(f"{len(all_ads - uploaded)} ads in Google Ads not in the database")
         if uploaded - all_ads:
             mism.append(f"{len(uploaded - all_ads)} ads in the database not found in Google Ads")
+        url_of = {x: u for (g, u), v in ads_per.items() for x in v}
+        for r in con.execute("SELECT ad_resource, final_url, title FROM articles WHERE "
+                             "ad_resource IS NOT NULL AND status='uploaded'"):
+            g_url = url_of.get(r["ad_resource"])
+            if g_url and g_url != r["final_url"]:
+                mism.append(f"ad {r['ad_resource'].rsplit('~', 1)[-1]}: Google Ads URL {g_url} "
+                            f"differs from stored {r['final_url']}")
+            elif config.rewrite_url(r["final_url"]) != r["final_url"]:
+                pending.append(f"ad {r['ad_resource'].rsplit('~', 1)[-1]}: URL")
         for g in con.execute("SELECT g.adgroup_res FROM adgroups g JOIN campaigns c ON "
                              "g.campaign_key=c.key WHERE g.alcohol=1 AND g.adgroup_res IS NOT "
                              "NULL AND c.status!='removed'").fetchall():
@@ -248,7 +257,7 @@ def run(w):
         dup += [f"image asset '{k}' x{v}" for k, v in acnt.items() if v > 1]
         summary = (f"{len(camps)} campaigns, {len(ags)} ad groups, {len(all_ads)} ads checked; "
                    f"duplicates: {dup[:20] or 'none'}; mismatches: {mism[:20] or 'none'}; "
-                   f"labels / device opt-out still to be done by the worker: {len(pending)} "
+                   f"labels / devices / URLs still to be done by the worker: {len(pending)} "
                    f"{pending[:3] if pending else ''}")
         return not dup and not mism, summary
 

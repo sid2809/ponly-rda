@@ -65,7 +65,9 @@ def connect(path=None):
                              ("adgroups", "topic_attempts", "INTEGER DEFAULT 0"),
                              ("campaigns", "devices_ok", "REAL"),
                              ("campaigns", "device_attempts", "INTEGER DEFAULT 0"),
-                             ("campaigns", "device_error", "TEXT")):
+                             ("campaigns", "device_error", "TEXT"),
+                             ("articles", "url_attempts", "INTEGER DEFAULT 0"),
+                             ("articles", "url_error", "TEXT")):
         have = {r[1] for r in con.execute(f"PRAGMA table_info({table})")}
         if col not in have:
             con.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")

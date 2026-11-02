@@ -220,6 +220,19 @@ class Stub:
                 results.append(NS(resource_name=u.resource_name))
         return NS(results=results, partial_failure_error=None)
 
+    def mutate_ads(self, request):
+        """AdService: like Google, an update changes only the fields named in update_mask."""
+        self.ad_updates = getattr(self, "ad_updates", 0) + 1
+        out = []
+        for op in request["operations"]:
+            ad_id = op.update.resource_name.rsplit("/", 1)[1]
+            for i, (g, u, r) in enumerate(self.ent["ad"]):
+                if r.endswith("~" + ad_id) and "final_urls" in list(op.update_mask.paths) \
+                        and not getattr(self, "ignore_ad_updates", False):
+                    self.ent["ad"][i] = (g, op.update.final_urls[0], r)
+            out.append(NS(resource_name=op.update.resource_name))
+        return NS(results=out, partial_failure_error=None)
+
     def mutate_campaigns(self, request):
         out, bad = [], []
         if request["operations"] and request["operations"][0].remove:
@@ -317,7 +330,8 @@ class Stub:
                            policy_summary=NS(approval_status=NS(name="APPROVED"),
                                              review_status=NS(name="REVIEWED"),
                                              policy_topic_entries=[])))
-                    for g, u, r in e["ad"] if keep(g) or "campaign.id IN" in query]
+                    for g, u, r in e["ad"] if keep(g) or "campaign.id IN" in query or
+                    ("ad_group_ad.resource_name IN" in query and keep(r))]
         if frm == "ad_group_ad_asset_view":
             return []
         if frm == "asset":

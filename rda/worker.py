@@ -1258,6 +1258,9 @@ class Worker:
                   count("SELECT COUNT(*) FROM campaigns WHERE status='held' OR (status='created' "
                         "AND error LIKE 'not enabled%')")],
                  ["Ad groups with all topics / created (topic waves)", self._topic_counts()],
+                 ["Uploaded ads still on an old URL (/cook/) / failed 3 times",
+                  f"{sum(1 for r in con.execute('SELECT final_url FROM articles WHERE status=? AND final_url IS NOT NULL', ('uploaded',)) if config.rewrite_url(r[0]) != r[0])}"
+                  f" / {count('SELECT COUNT(*) FROM articles WHERE url_attempts>=3')}"],
                  ["Campaigns with desktop + TV screens opted out (confirmed in Google Ads) / all",
                   f"{count('SELECT COUNT(*) FROM campaigns WHERE devices_ok IS NOT NULL AND status NOT IN (?,?)', 'removed', 'failed')}"
                   f" / {count('SELECT COUNT(*) FROM campaigns WHERE campaign_res IS NOT NULL AND status NOT IN (?,?)', 'removed', 'failed')}"
@@ -1380,6 +1383,7 @@ class Worker:
             if ads_ok:
                 self.run_step("labels", lambda: self.ads.add_missing_labels())
                 self.run_step("devices", lambda: self.ads.ensure_devices())
+                self.run_step("ad_urls", lambda: self.ads.update_final_urls())
         finally:
             # read-only: keeps approvals, clicks and cost current even while paused
             self.run_step("sync", self.step_sync)
