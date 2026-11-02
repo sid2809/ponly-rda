@@ -101,6 +101,13 @@ def topics_of(g):
         return {}
 
 
+def topic_set(con):
+    """The configured topics' resource names, once looked up from Google (else None)."""
+    cache = db.kv_get(con, "topic_constants") or {}
+    keys = [" / ".join(p) for p in config.TOPIC_PATHS]
+    return {cache[k] for k in keys} if all(k in cache for k in keys) else None
+
+
 def _topic_path(path):
     """['', 'Food & Drink', 'Cooking & Recipes'] or ['/Food & Drink/Cooking & Recipes']
     -> ('Food & Drink', 'Cooking & Recipes')"""
@@ -506,11 +513,13 @@ class Ads:
             return True
         if topics_wanted(wave):
             n_topics = len(config.TOPIC_PATHS)
+            want_t = topic_set(con)
             for g in con.execute("SELECT g.* FROM adgroups g JOIN campaigns c ON "
                                  "g.campaign_key=c.key WHERE c.wave=? AND c.status!='failed' AND "
                                  "g.adgroup_res IS NOT NULL AND COALESCE(g.topic_attempts,0)<?",
                                  (wave, EXCL_TRIES)).fetchall():
-                if len(topics_of(g)) < n_topics:
+                have = set(topics_of(g))
+                if (want_t - have) if want_t else len(have) < n_topics:
                     return True
         for c in con.execute("SELECT * FROM campaigns WHERE wave=? AND status!='failed' AND "
                              "COALESCE(label_attempts,0)<3", (wave,)).fetchall():
@@ -938,12 +947,15 @@ class Ads:
                 if x.ad_group_criterion.age_range.type_.name == "AGE_RANGE_18_24":
                     found["excl"][x.ad_group.resource_name] = x.ad_group_criterion.resource_name
             if topics_wanted(wave):
+                want_t = set(self.topic_constants())        # adopt only our topics
                 for x in self.search("SELECT ad_group_criterion.resource_name, "
                                      "ad_group.resource_name, ad_group_criterion.topic.topic_constant"
                                      f" FROM ad_group_criterion WHERE ad_group.resource_name IN ({q})"
                                      " AND ad_group_criterion.type = 'TOPIC' AND "
                                      "ad_group_criterion.negative = FALSE AND "
                                      "ad_group_criterion.status != 'REMOVED'", "reconcile"):
+                    if x.ad_group_criterion.topic.topic_constant not in want_t:
+                        continue
                     found["topic"].setdefault(x.ad_group.resource_name, {})[
                         x.ad_group_criterion.topic.topic_constant] = \
                         x.ad_group_criterion.resource_name

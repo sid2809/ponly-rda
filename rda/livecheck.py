@@ -195,7 +195,8 @@ def run(w):
         dup += [f"18-24 exclusion x{v} on {g}" for g, v in excl.items() if v > 1]
         # topics (waves the pipeline adds them to): duplicates, and enabled campaigns whose
         # ad groups lack any of them
-        from .gads import topics_wanted
+        from .gads import topic_set, topics_wanted
+        want_t = topic_set(con)
         tops = {}
         for part in _chunks(ag_res):
             q = ",".join(_q(r) for r in part)
@@ -213,7 +214,8 @@ def run(w):
                              "campaigns c ON g.campaign_key=c.key WHERE c.status='enabled' AND "
                              "g.adgroup_res IS NOT NULL").fetchall():
             if topics_wanted(g["wave"]):
-                n = len({t for (ag, t) in tops if ag == g["adgroup_res"]})
+                n = len({t for (ag, t) in tops if ag == g["adgroup_res"] and
+                         (want_t is None or t in want_t)})
                 if n < n_topics:
                     mism.append(f"enabled ad group {g['name']} has {n} of {n_topics} topics")
         uploaded = {r["ad_resource"] for r in con.execute(

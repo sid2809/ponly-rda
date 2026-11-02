@@ -151,3 +151,34 @@ def test_live_check_reports_enabled_ad_group_missing_topics():
         livecheck.run(w)
         line = next(x for x in w.logs if "duplicates / mismatches" in x)
         assert "FAIL" in line and "has 2 of 3 topics" in line
+
+
+def test_reconcile_ignores_a_foreign_topic_and_the_missing_one_is_still_added():
+    with tempfile.TemporaryDirectory() as tmp:
+        con, ads, stub, logos = setup(tmp, wave=2)
+        drive(ads, logos)
+        ag = stub.ent["ag"][0][2]
+        stub.ent["topic"] = [x for x in stub.ent["topic"] if x[2] != "topicConstants/5"]
+        stub.ent["topic"].append((ag, "customers/1/adGroupCriteria/x", "topicConstants/900"))
+        con.execute("UPDATE adgroups SET topics_res=NULL")
+        ads.reconcile(2)
+        g = con.execute("SELECT * FROM adgroups").fetchone()
+        assert set(json.loads(g["topics_res"])) == TOPIC_RES - {"topicConstants/5"}
+        assert ads.has_work(2)
+        drive(ads, logos)
+        ours = {t for _, _, t in stub.ent["topic"] if t in TOPIC_RES}
+        assert ours == TOPIC_RES
+
+
+def test_live_check_does_not_count_a_foreign_topic():
+    with tempfile.TemporaryDirectory() as tmp:
+        con, ads, stub, logos = setup(tmp, wave=2)
+        drive(ads, logos)
+        assert ads.enable_wave(2) == 1
+        ag = stub.ent["ag"][0][2]
+        stub.ent["topic"].pop()
+        stub.ent["topic"].append((ag, "customers/1/adGroupCriteria/x", "topicConstants/900"))
+        w = _live_worker(con, ads)
+        livecheck.run(w)
+        line = next(x for x in w.logs if "duplicates / mismatches" in x)
+        assert "has 2 of 3 topics" in line

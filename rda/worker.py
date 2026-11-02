@@ -1062,15 +1062,17 @@ class Worker:
         return f"{waiting} waiting; ~{hour}/hour now -> ~{waiting / hour:.1f} h (estimate)"
 
     def _topic_counts(self):
-        from .gads import topics_of, topics_wanted
+        from .gads import topic_set, topics_of, topics_wanted
         n = len(config.TOPIC_PATHS)
+        want_t = topic_set(self.con)
         done = made = 0
         for g in self.con.execute("SELECT g.topics_res, c.wave FROM adgroups g JOIN campaigns c "
                                   "ON g.campaign_key=c.key WHERE g.adgroup_res IS NOT NULL AND "
                                   "c.status!='removed'"):
             if topics_wanted(g["wave"]):
                 made += 1
-                done += len(topics_of(g)) >= n
+                have = set(topics_of(g))
+                done += not (want_t - have) if want_t else len(have) >= n
         return f"{done} / {made}"
 
     def summary_rows(self):
