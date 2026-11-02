@@ -435,11 +435,15 @@ class Worker:
         they are. Never runs while a Google Ads upload job is open (its results would no longer
         match). Cheap and idempotent: runs every loop, logs only when it changed something."""
         con = self.con
-        if db.open_jobs(con, "gads") or con.execute(
-                "SELECT 1 FROM kv WHERE k LIKE 'reconcile_due_%'").fetchone():
-            return            # a lost job is still being matched by URL: change nothing yet
-        rows = con.execute("SELECT id, final_url FROM articles WHERE ad_resource IS NULL AND "
-                           "status!='uploaded' AND final_url IS NOT NULL").fetchall()
+        # waves with an open upload job, or a lost job still being matched by URL: leave
+        # their articles alone for now (per wave, so nothing old can block the others)
+        busy = {j["wave"] for j in db.open_jobs(con, "gads")}
+        busy |= {int(r["k"].rsplit("_", 1)[1]) for r in con.execute(
+            "SELECT k FROM kv WHERE k LIKE 'reconcile|_due|_%' ESCAPE '|'")
+            if r["k"].rsplit("_", 1)[1].lstrip("-").isdigit()}
+        rows = [r for r in con.execute(
+            "SELECT id, wave, final_url FROM articles WHERE ad_resource IS NULL AND "
+            "status!='uploaded' AND final_url IS NOT NULL") if r["wave"] not in busy]
         changed = [(config.rewrite_url(r["final_url"]), r["id"]) for r in rows
                    if config.rewrite_url(r["final_url"]) != r["final_url"]]
         if not changed:

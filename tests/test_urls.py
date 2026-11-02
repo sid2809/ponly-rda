@@ -73,3 +73,14 @@ def test_new_articles_are_loaded_with_the_new_url(tmp):
     rows = w.con.execute("SELECT url, final_url FROM articles WHERE final_url IS NOT NULL").fetchall()
     assert rows and all(r["url"].startswith("https://ponly.com/cook/") and
                         r["final_url"] == config.rewrite_url(r["url"]) for r in rows)
+
+
+def test_a_busy_wave_never_blocks_another_wave(tmp):
+    w = make(every=200)
+    _art(w, "a2", "planned", wave=2)
+    _art(w, "a3", "themed", wave=3)
+    db.kv_set(w.con, "reconcile_due_1", 1)                 # an old wave 1 marker left over
+    db.new_job(w.con, "gads", 3, payload={"index": []}, state="running")
+    w.step_fix_urls()
+    assert url(w, "a2") == "https://ponly.com/cooks/a2/"   # wave 2 still updated
+    assert url(w, "a3") == "https://ponly.com/cook/a3/"    # wave 3 waits for its job
