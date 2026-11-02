@@ -46,7 +46,9 @@ def _params(content, schema, max_tokens):
             "output_config": {"format": {"type": "json_schema", "schema": schema}}}
 
 
-def copy_params(title, category, theme, problems=None, big=False):
+def copy_params(title, category, theme, problems=None, big=False, year=None):
+    from .lint import current_year
+    year = year or current_year()
     fix = ""
     if problems:
         fix = ("\nYour previous attempt failed these checks; fix them:\n- "
@@ -62,6 +64,11 @@ Rules:
 - descriptions: exactly 5, each at most 90 characters, all different.
 - Describe only what the title says. No numbers unless they are in the title. No prices,
   times, ratings, health claims, superlatives (best, #1), urgency, or clickbait.
+- One exception: you may write headlines of exactly this form: "Best [dish] Recipe {year}",
+  where [dish] is the dish name using only words from the title (you may leave words out,
+  never add any). Use it in as many headlines as you think fit, or in none. Use it only if
+  the whole headline fits in 30 characters; if it does not fit, do not use it at all.
+  "Best" and the year may appear nowhere else.
 - No ALL-CAPS words, no exclamation marks in headlines, no repeated punctuation.
 - image_prompt: one sentence describing a photorealistic photo of this exact dish,
   plated, natural light. No text, no logos, no people, no hands. Dish centred.{fix}"""

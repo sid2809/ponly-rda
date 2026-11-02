@@ -710,6 +710,88 @@ class Worker:
             return
         self._submit("copy", w, reqs)
 
+    # ------------------------------------------------- recopy (one-off, wave 2)
+    def step_recopy(self, w):
+        """Siddharth 2 Nov 2026: wave 2's copy was written before the 'Best [dish] Recipe
+        YEAR' headline was allowed, so it is written again once with the current prompt.
+        Article statuses (and so images and checks) are never touched: only copy_json is
+        replaced, and only by copy that passes the checks. Copy that fails twice keeps the
+        old copy (it passed the checks before). Planning waits until this is finished."""
+        con = self.con
+        if w != 2:
+            return
+        st = db.kv_get(con, "recopy_2", {})
+        if st.get("done"):
+            return
+        if not st:
+            if db.kv_get(con, "planned_2") or con.execute(
+                    "SELECT 1 FROM articles WHERE wave=2 AND status IN ('planned','uploaded')"
+            ).fetchone():
+                db.kv_set(con, "recopy_2", {"done": True, "skipped": "wave 2 already planned"})
+                self.log("recopy wave 2: not run (wave 2 already planned)")
+                return
+            if con.execute("SELECT 1 FROM articles WHERE wave=2 AND status IN "
+                           "('queued','url_ok','tagged','themed','copy_pending')").fetchone():
+                return                         # first copy round still running: wait for it
+            ids = [r["id"] for r in con.execute(
+                "SELECT id FROM articles WHERE wave=2 AND copy_json IS NOT NULL AND status IN "
+                "('copy_done','image_pending','image_done','check_pending','checked')")]
+            st = {"round": 1, "todo": ids, "problems": {}, "replaced": 0, "kept": 0}
+            db.kv_set(con, "recopy_2", st)
+            self.log(f"recopy wave 2: {len(ids)} articles get new copy (images untouched)")
+        if st.get("batch"):
+            if not self.claude.batch_ended(st["batch"]):
+                return
+            res = self.claude.batch_results(st["batch"])
+            retry = {}
+            with db.tx(con):
+                for aid in st["todo"]:
+                    a = con.execute("SELECT * FROM articles WHERE id=?", (aid,)).fetchone()
+                    if not a or a["status"] in ("planned", "uploaded", "skipped", "error"):
+                        continue
+                    kind, data = res.get(f"rc{st['round']}-{aid}", ("api", "no result"))
+                    problems = lint.check_copy(data, a["title"]) if kind == "ok" else \
+                        [f"no usable answer ({kind})"]
+                    if not problems:
+                        db.update_article(con, aid, copy_json=json.dumps(data))
+                        st["replaced"] += 1
+                    elif st["round"] == 1:
+                        retry[aid] = problems
+                    else:
+                        st["kept"] += 1
+                        db._log_after_commit(con, f"recopy wave 2: {aid} kept its old copy "
+                                                  f"(new copy failed twice: "
+                                                  f"{short('; '.join(problems), 200)})")
+                st.pop("batch")
+                if retry and st["round"] == 1:
+                    st.update(round=2, todo=list(retry), problems=retry)
+                else:
+                    st.update(done=True, todo=[], problems={})
+                db.kv_set(con, "recopy_2", st)
+            self.log(f"recopy wave 2: round {st['round'] if not st.get('done') else 'final'}: "
+                     f"replaced {st['replaced']}, kept old {st['kept']}, "
+                     f"retrying {len(retry) if not st.get('done') else 0}")
+            if st.get("done"):
+                return
+        if not st.get("todo"):
+            st["done"] = True
+            db.kv_set(con, "recopy_2", st)
+            return
+        reqs = []
+        for aid in st["todo"]:
+            a = con.execute("SELECT * FROM articles WHERE id=?", (aid,)).fetchone()
+            if not a:
+                continue
+            reqs.append((f"rc{st['round']}-{aid}",
+                         llm.copy_params(a["title"], a["category"], a["theme"],
+                                         st["problems"].get(aid),
+                                         big=bool((a["big_tokens"] or 0) & BIG["copy"]))))
+        bid = self.claude.create_batch(reqs)
+        st["batch"] = bid
+        db.kv_set(con, "recopy_2", st)
+        self.log(f"recopy wave 2: batch {bid} created ({len(reqs)} requests, round "
+                 f"{st['round']})")
+
     # ---------------------------------------------------------------- images
     def poll_images(self):
         """R3: own step, every tick, also while paused, never backed off."""
@@ -878,6 +960,8 @@ class Worker:
         con = self.con
         if db.kv_get(con, f"planned_{w}"):
             return
+        if w == 2 and not db.kv_get(con, "recopy_2", {}).get("done"):
+            return                     # wave 2 copy is being written again first
         if con.execute(f"SELECT 1 FROM articles WHERE wave=? AND status IN "
                        f"({','.join('?' * len(IN_PROGRESS))})", (w, *IN_PROGRESS)).fetchone():
             return
@@ -1146,6 +1230,9 @@ class Worker:
                   count("SELECT COUNT(*) FROM campaigns WHERE status='held' OR (status='created' "
                         "AND error LIKE 'not enabled%')")],
                  ["Ad groups with all topics / created (topic waves)", self._topic_counts()],
+                 ["Wave 2 copy written again ('Best ... Recipe YEAR' allowed)",
+                  json.dumps({k: v for k, v in db.kv_get(con, "recopy_2", {}).items()
+                              if k not in ("todo", "problems")})],
                  ["Ad review status (count)", json.dumps({r[0] or "-": r[1] for r in con.execute(
                      "SELECT review_status, COUNT(*) FROM articles WHERE status='uploaded' "
                      "GROUP BY review_status")})],
@@ -1250,7 +1337,8 @@ class Worker:
             for w in (1, 2, 3):
                 if self.stop.is_set() or not self.content_allowed(w):
                     continue
-                for name, fn in (("copy", self.step_copy), ("images", self.step_images),
+                for name, fn in (("copy", self.step_copy), ("recopy", self.step_recopy),
+                                 ("images", self.step_images),
                                  ("check", self.step_check), ("plan", self.step_plan),
                                  ("upload", self.step_upload), ("enable", self.step_enable)):
                     if name in ("upload", "enable") and not ads_ok:
