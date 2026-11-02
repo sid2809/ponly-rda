@@ -46,6 +46,16 @@ BRAND_LABEL = "Ponly Cook"
 IMAGE_MODEL = "minimax"
 MODEL_LABELS = {"minimax": "minimax", "nano-banana": "Nano Banana"}   # on every campaign (Siddharth, 23 Oct) + a category label
 DOMAIN_PREFIX = "https://ponly.com/"
+# Siddharth 2 Nov 2026: ponly.com/cook/<slug> is now ponly.com/cooks/<slug> (slug unchanged).
+URL_REWRITES = (("https://ponly.com/cook/", "https://ponly.com/cooks/"),)
+
+
+def rewrite_url(url):
+    """Final URL for an ad: only the listed prefixes change; the slug stays as it is."""
+    for old, new in URL_REWRITES:
+        if url and url.startswith(old):
+            return new + url[len(old):]
+    return url
 BUDGET_PER_ARTICLE_INR = 300
 MAX_CPC_INR = 2
 # Siddharth 23 Oct: 6-8 articles per campaign, 2-4 articles per ad group.

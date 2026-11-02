@@ -427,6 +427,29 @@ class Worker:
         db.update_article(self.con, a["id"], **fields)
         return True
 
+    # --------------------------------------------------------- URL rewrite
+    def step_fix_urls(self):
+        """Siddharth 2 Nov 2026: /cook/ -> /cooks/. Updates the stored final URL of every
+        article that has no ad in Google Ads yet, so the ads are created with the new URL and
+        recovery / live check compare against the same URL. Ads already uploaded are left as
+        they are. Never runs while a Google Ads upload job is open (its results would no longer
+        match). Cheap and idempotent: runs every loop, logs only when it changed something."""
+        con = self.con
+        if db.open_jobs(con, "gads") or con.execute(
+                "SELECT 1 FROM kv WHERE k LIKE 'reconcile_due_%'").fetchone():
+            return            # a lost job is still being matched by URL: change nothing yet
+        rows = con.execute("SELECT id, final_url FROM articles WHERE ad_resource IS NULL AND "
+                           "status!='uploaded' AND final_url IS NOT NULL").fetchall()
+        changed = [(config.rewrite_url(r["final_url"]), r["id"]) for r in rows
+                   if config.rewrite_url(r["final_url"]) != r["final_url"]]
+        if not changed:
+            return
+        with db.tx(con):
+            for new, aid in changed:
+                con.execute("UPDATE articles SET final_url=? WHERE id=?", (new, aid))
+        self.log(f"final URLs updated for {len(changed)} articles not yet uploaded "
+                 f"(e.g. {changed[0][0]})")
+
     # ------------------------------------------------------------------ load
     def step_load(self):
         if db.kv_get(self.con, "waves_assigned"):
@@ -456,7 +479,8 @@ class Worker:
             # No URL fetching (Siddharth, 23 Oct): only a text check that the URL is on ponly.com.
             for q in con.execute("SELECT id,url FROM articles WHERE status='queued'").fetchall():
                 if q["url"].startswith(config.DOMAIN_PREFIX):
-                    db.update_article(con, q["id"], status="url_ok", final_url=q["url"])
+                    db.update_article(con, q["id"], status="url_ok",
+                                      final_url=config.rewrite_url(q["url"]))
                 else:
                     db.update_article(con, q["id"], status="skipped",
                                       skip_reason="URL is not on ponly.com")
@@ -1329,6 +1353,7 @@ class Worker:
                 from . import preflight
                 self.run_step("preflight", preflight.run, self)
             self.run_step("load", self.step_load)
+            self.run_step("fix_urls", self.step_fix_urls)
             self.run_step("alcohol", self.step_alcohol)
             for pool, items in self.theme_pools().items():
                 errs = db.kv_get(self.con, "step_errors", {})
