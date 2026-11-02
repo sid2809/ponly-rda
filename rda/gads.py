@@ -335,6 +335,78 @@ class Ads:
         log(f"topics found in Google Ads: {cache}")
         return [cache[" / ".join(p)] for p in want]
 
+    def set_topic_targeting(self, ad_group):
+        """Topic setting on a new ad group: Targeting (narrows reach), not Observation."""
+        tr = self.client.get_type("TargetRestriction")
+        tr.targeting_dimension = self.e.TargetingDimensionEnum.TOPIC
+        tr.bid_only = False
+        ad_group.targeting_setting.target_restrictions.append(tr)
+
+    def topic_op(self, ag_res, tc):
+        op = self._op()
+        cr = op.ad_group_criterion_operation.create
+        cr.ad_group = ag_res
+        cr.status = self.e.AdGroupCriterionStatusEnum.ENABLED
+        cr.topic.topic_constant = tc
+        return op
+
+    def validate_topics(self):
+        """Validate-only (nothing is created): a paused campaign + ad group with the topic
+        setting and the 3 topic criteria, built by the same code the upload uses.
+        Returns (ok, note)."""
+        topics = self.topic_constants()
+        e, ops = self.e, []
+        bud = self.path("CampaignBudgetService", "campaign_budget_path", -1)
+        camp = self.path("CampaignService", "campaign_path", -2)
+        ag = self.path("AdGroupService", "ad_group_path", -3)
+        name = f"topic check {int(time.time())}"
+        op = self._op(); b = op.campaign_budget_operation.create
+        b.resource_name, b.name = bud, f"{name} | budget"
+        b.amount_micros = config.BUDGET_PER_ARTICLE_INR * 1_000_000
+        b.delivery_method = e.BudgetDeliveryMethodEnum.STANDARD
+        b.explicitly_shared = False
+        ops.append(op)
+        op = self._op(); x = op.campaign_operation.create
+        x.resource_name, x.name, x.campaign_budget = camp, name, bud
+        x.status = e.CampaignStatusEnum.PAUSED
+        x.advertising_channel_type = e.AdvertisingChannelTypeEnum.DISPLAY
+        x.target_spend.cpc_bid_ceiling_micros = config.MAX_CPC_INR * 1_000_000
+        x.contains_eu_political_advertising = (
+            e.EuPoliticalAdvertisingStatusEnum.DOES_NOT_CONTAIN_EU_POLITICAL_ADVERTISING)
+        x.network_settings.target_content_network = True
+        x.network_settings.target_google_search = False
+        x.network_settings.target_search_network = False
+        ops.append(op)
+        op = self._op(); a = op.ad_group_operation.create
+        a.resource_name, a.name, a.campaign = ag, f"{name} | ad group", camp
+        a.type_ = e.AdGroupTypeEnum.DISPLAY_STANDARD
+        a.status = e.AdGroupStatusEnum.ENABLED
+        a.optimized_targeting_enabled = False
+        self.set_topic_targeting(a)
+        ops.append(op)
+        ops += [self.topic_op(ag, tc) for tc in topics]
+        db.log_ops(self.con, len(ops), "livecheck")
+        try:
+            self.client.get_service("GoogleAdsService").mutate(request={
+                "customer_id": self.cid, "mutate_operations": ops, "validate_only": True})
+        except Exception as ex:
+            errs = getattr(getattr(ex, "failure", None), "errors", None) or []
+            msgs = []
+            for er in errs:
+                code = ""
+                try:
+                    f_ = er.error_code._pb.WhichOneof("error_code")
+                    code = f"{f_}.{getattr(er.error_code, f_).name}: " if f_ else ""
+                except Exception:
+                    pass
+                msgs.append(f"{code}{er.message}")
+            return False, ("Google refused the topic test (validate-only, nothing created): "
+                           + short("; ".join(msgs) or str(ex), 600))
+        names = {v: k for k, v in (db.kv_get(self.con, "topic_constants") or {}).items()}
+        return True, (f"Google accepted an ad group with topic Targeting and "
+                      f"{len(topics)} topics (validate-only, nothing created): "
+                      f"{', '.join(f'{names.get(t, t)} = {t}' for t in topics)}")
+
     # ---------- operation builders ----------
     def iter_units(self, wave, logos, label_res=None, topics=None):
         """Yield one unit per campaign: (campaign_key, ops, index_entries). Built lazily, so
@@ -421,10 +493,7 @@ class Ads:
                     a.status = self.e.AdGroupStatusEnum.ENABLED
                     a.optimized_targeting_enabled = False
                     if topics_wanted(wave):
-                        tr = self.client.get_type("TargetRestriction")
-                        tr.targeting_dimension = self.e.TargetingDimensionEnum.TOPIC
-                        tr.bid_only = False          # Targeting (narrows reach), not Observation
-                        a.targeting_setting.target_restrictions.append(tr)
+                        self.set_topic_targeting(a)
                     ops.append(op); idx.append({"t": "adgroup", "k": g["key"]})
                 if g["alcohol"] and not g["exclusion_res"] and \
                         (g["excl_attempts"] or 0) < EXCL_TRIES:
@@ -439,12 +508,8 @@ class Ads:
                     for tc in topics:
                         if tc in have:
                             continue
-                        op = self._op()
-                        cr = op.ad_group_criterion_operation.create
-                        cr.ad_group = ag_res
-                        cr.status = self.e.AdGroupCriterionStatusEnum.ENABLED
-                        cr.topic.topic_constant = tc
-                        ops.append(op); idx.append({"t": "topic", "k": g["key"], "tc": tc})
+                        ops.append(self.topic_op(ag_res, tc))
+                        idx.append({"t": "topic", "k": g["key"], "tc": tc})
                 arts = con.execute("SELECT * FROM articles WHERE adgroup_key=? AND status='planned'"
                                    " ORDER BY id", (g["key"],)).fetchall()
                 for art in arts:

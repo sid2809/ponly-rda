@@ -292,6 +292,7 @@ def run(w):
     check("Google Ads duplicates / mismatches", duplicates)
     check("Google Ads enable (validate-only)", enable_validate_only)
     check("Google Ads batch job remove", batch_remove)
+    check("Google Ads topics (validate-only)", ads.validate_topics)
     check("Google Ads labels + time zone", labels_tz)
 
     # ---------------------------------------------------------------- Anthropic

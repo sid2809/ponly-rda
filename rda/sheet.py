@@ -11,8 +11,7 @@ SETTINGS_DEFAULTS = [
     ["W1 enable", False, "Tick to enable Wave 1 (pilot) campaigns"],
     ["W2 enable", False, "Tick to enable Wave 2 campaigns"],
     ["W3 enable", False, "Tick to enable Wave 3 campaigns"],
-    ["Image model", "", "Set after the pilot: nano-banana or minimax. Wave 2 images start "
-                        "only once this is set. Change any time; applies to new images."],
+    ["Image model", "minimax", "Fixed to minimax in the code (2 Nov). This cell is ignored."],
     ["Daily API quota cap", config.DEFAULT_QUOTA_CAP, "14000 at Basic; 2700 at Explorer; "
                                                       "lower it if other tools share the project"],
     ["Access level", "Basic", "Google Ads API level of the Cloud project (Basic/Explorer)"],

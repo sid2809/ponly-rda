@@ -182,3 +182,41 @@ def test_live_check_does_not_count_a_foreign_topic():
         livecheck.run(w)
         line = next(x for x in w.logs if "duplicates / mismatches" in x)
         assert "has 2 of 3 topics" in line
+
+
+def test_live_check_validates_topic_targeting_without_creating_anything():
+    with tempfile.TemporaryDirectory() as tmp:
+        con, ads, stub, logos = setup(tmp, wave=1)
+        drive(ads, logos)
+        before = {k: len(v) for k, v in stub.ent.items()}
+        w = _live_worker(con, ads)
+        livecheck.run(w)
+        line = next(x for x in w.logs if "topics (validate-only)" in x)
+        assert "OK" in line and "Food & Drink / Cooking & Recipes = topicConstants/122" in line
+        ops = stub.validated[-1]
+        kinds = [op._pb.WhichOneof("operation") for op in ops]
+        assert kinds == ["campaign_budget_operation", "campaign_operation", "ad_group_operation"] \
+            + ["ad_group_criterion_operation"] * 3
+        ag = ops[2].ad_group_operation.create
+        assert [(t.targeting_dimension.name, t.bid_only)
+                for t in ag.targeting_setting.target_restrictions] == [("TOPIC", False)]
+        assert {o.ad_group_criterion_operation.create.topic.topic_constant
+                for o in ops[3:]} == TOPIC_RES
+        assert ops[1].campaign_operation.create.status.name == "PAUSED"
+        assert {k: len(v) for k, v in stub.ent.items()} == before  # nothing created
+
+
+def test_live_check_reports_google_refusing_the_topic_test():
+    with tempfile.TemporaryDirectory() as tmp:
+        con, ads, stub, logos = setup(tmp, wave=1)
+        drive(ads, logos)
+        stub.refuse_validate = "INVALID_TOPIC"
+        w = _live_worker(con, ads)
+        livecheck.run(w)
+        line = next(x for x in w.logs if "topics (validate-only)" in x)
+        assert "FAIL" in line and "INVALID_TOPIC" in line
+
+
+def test_new_images_use_minimax_in_every_wave():
+    from rda import config
+    assert config.IMAGE_MODEL == "minimax"

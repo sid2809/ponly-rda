@@ -41,6 +41,9 @@ IMAGE_MODELS = {
 BUSINESS_NAME = "Leapfour Media Pvt Ltd"
 BRAND_LABEL = "Ponly Cook"
 # Siddharth 24 Oct: a label per image model so campaigns can be filtered in Google Ads
+# Siddharth 2 Nov 2026: every new image is made with minimax (not nano-banana), whatever the
+# Settings tab says. nano-banana stays listed only so pilot campaigns keep their label.
+IMAGE_MODEL = "minimax"
 MODEL_LABELS = {"minimax": "minimax", "nano-banana": "Nano Banana"}   # on every campaign (Siddharth, 23 Oct) + a category label
 DOMAIN_PREFIX = "https://ponly.com/"
 BUDGET_PER_ARTICLE_INR = 300

@@ -74,6 +74,14 @@ class Stub:
         job["results"] = [self._exec(i, op) for i, op in enumerate(job["ops"])]
         job["status"] = "DONE"
 
+    def mutate(self, request=None, **kw):
+        """GoogleAdsService.Mutate: only the validate-only topic test uses it here."""
+        assert request["validate_only"] is True
+        self.validated = getattr(self, "validated", []) + [request["mutate_operations"]]
+        if getattr(self, "refuse_validate", None):
+            raise RuntimeError(self.refuse_validate)
+        return NS(mutate_operation_responses=[])
+
     def list_batch_job_results(self, request):
         return self.jobs[request["resource_name"]]["results"]
 

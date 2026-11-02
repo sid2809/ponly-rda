@@ -363,7 +363,8 @@ def test_settings_parsing(tmp):
     assert w.quota_cap() == 2700
     w.settings["Access level"] = "Basic"
     assert w.quota_cap() == 14000
-    assert w.chosen_model() == "nano-banana"
+    assert w.chosen_model() == "minimax"            # fixed in code (2 Nov); cell ignored
+    assert any("ignored" in p for p in w.settings_problems)
     assert w.sizes() == (6, 8, 2, 4)
     assert any("six" in p for p in w.settings_problems)
 

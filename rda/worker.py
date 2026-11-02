@@ -150,12 +150,14 @@ class Worker:
         return tuple(v) if ok else None
 
     def chosen_model(self):
+        """Siddharth 2 Nov 2026: minimax for every new image, fixed in code. The Settings
+        'Image model' cell is ignored (reported if it says something else)."""
         m = str((self.settings or {}).get("Image model", "")).strip().lower()
         m = m.replace(" ", "-").replace("_", "-")
-        if m and m not in config.IMAGE_MODELS:
-            self.settings_problems.append(f"Image model '{m}' unknown (use: "
-                                          f"{', '.join(config.IMAGE_MODELS)})")
-        return m if m in config.IMAGE_MODELS else None
+        if m and m != config.IMAGE_MODEL:
+            self.settings_problems.append(f"Image model '{m}' in Settings is ignored: images "
+                                          f"are made with {config.IMAGE_MODEL} (fixed in code)")
+        return config.IMAGE_MODEL
 
     def quota_cap(self):
         cap = self.num("Daily API quota cap", config.DEFAULT_QUOTA_CAP)
@@ -738,7 +740,7 @@ class Worker:
         con = self.con
         began = time.time()
         for a in todo:
-            model = a["image_model"] if w == 1 else self.chosen_model()
+            model = self.chosen_model()        # minimax for every new image, any wave
             if not model:
                 return
             if a["image_attempts"] >= 3:
