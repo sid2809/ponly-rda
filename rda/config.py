@@ -49,6 +49,13 @@ MAX_CPC_INR = 2
 # Leftovers: under 6 -> one campaign; 9-11 -> one campaign; 17 -> 9 + 8.
 CAMPAIGN_MIN, CAMPAIGN_MAX = 6, 8
 ADGROUP_MIN, ADGROUP_MAX = 2, 4
+# Siddharth 2 Nov 2026: topic targeting on every ad group the pipeline creates, mode Targeting
+# (narrows reach). Exactly the 3 topics from his screenshot. Topic IDs are looked up from Google
+# by these paths at upload time; nothing is guessed.
+TOPIC_PATHS = [("Food & Drink", "Beverages"), ("Food & Drink", "Food"),
+               ("Food & Drink", "Cooking & Recipes")]
+# Wave 1 is the live pilot: its ad groups are left exactly as they are (not decided yet).
+TOPICS_SKIP_WAVES = (1,)
 GEO_US = "geoTargetConstants/2840"
 LANG_EN = "languageConstants/1000"
 UTM_SUFFIX = ("utm_source=google&utm_medium=display&utm_campaign={campaignid}"

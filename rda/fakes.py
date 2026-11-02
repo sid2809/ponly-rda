@@ -154,6 +154,10 @@ def fake_ads(con):
             db.kv_set(self.con, f"labels_{self.cid}", known)
             return known
 
+        def topic_constants(self):
+            from . import config
+            return [f"topicConstants/{i + 1}" for i in range(len(config.TOPIC_PATHS))]
+
         def upload_logos(self):
             return {"landscape": f"customers/{self.cid}/assets/1",
                     "square": f"customers/{self.cid}/assets/2"}

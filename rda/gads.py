@@ -88,6 +88,25 @@ class QuotaExhausted(Exception):
     pass
 
 
+def topics_wanted(wave):
+    """Topic targeting on this wave's ad groups? (wave 1 = live pilot, left as it is)"""
+    return wave not in config.TOPICS_SKIP_WAVES
+
+
+def topics_of(g):
+    """{topic constant: ad group criterion resource} already in Google Ads for this ad group."""
+    try:
+        return json.loads(g["topics_res"] or "{}")
+    except (TypeError, ValueError, IndexError, KeyError):
+        return {}
+
+
+def _topic_path(path):
+    """['', 'Food & Drink', 'Cooking & Recipes'] or ['/Food & Drink/Cooking & Recipes']
+    -> ('Food & Drink', 'Cooking & Recipes')"""
+    return tuple(p for x in path for p in str(x).split("/") if p.strip())
+
+
 class Ads:
     def __init__(self, con, client=None):
         self.con = con
@@ -284,12 +303,39 @@ class Ads:
         db.kv_set(self.con, f"label_problems_{self.cid}", problems)
         return known
 
+    # ---------- topics ----------
+    def topic_constants(self):
+        """{('Food & Drink', 'Food'): 'topicConstants/N', ...} for config.TOPIC_PATHS, read from
+        Google (1 search, then cached). Stops with an error if any path is missing or matches
+        more than once: topics are never guessed."""
+        want = [tuple(p) for p in config.TOPIC_PATHS]
+        cache = db.kv_get(self.con, "topic_constants") or {}
+        if all(" / ".join(p) in cache for p in want):
+            return [cache[" / ".join(p)] for p in want]
+        found = {}
+        for x in self.search("SELECT topic_constant.resource_name, topic_constant.path FROM "
+                             "topic_constant", "topics"):
+            p = _topic_path(x.topic_constant.path)
+            if p in want:
+                found.setdefault(p, []).append(x.topic_constant.resource_name)
+        bad = [f"{' / '.join(p)}: {len(found.get(p, []))} matches" for p in want
+               if len(found.get(p, [])) != 1]
+        if bad:
+            raise RuntimeError(f"topic lookup: each topic must match exactly once in Google "
+                               f"Ads ({'; '.join(bad)}); nothing uploaded")
+        cache = {" / ".join(p): found[p][0] for p in want}
+        db.kv_set(self.con, "topic_constants", cache)
+        log(f"topics found in Google Ads: {cache}")
+        return [cache[" / ".join(p)] for p in want]
+
     # ---------- operation builders ----------
-    def iter_units(self, wave, logos, label_res=None):
+    def iter_units(self, wave, logos, label_res=None, topics=None):
         """Yield one unit per campaign: (campaign_key, ops, index_entries). Built lazily, so
         image bytes are read only for units actually used (P7). Temp IDs unique per call."""
         con = self.con
         tid = [-1]
+        if topics is None and topics_wanted(wave):
+            topics = self.topic_constants()
 
         def temp():
             v = tid[0]
@@ -367,6 +413,11 @@ class Ads:
                     a.type_ = self.e.AdGroupTypeEnum.DISPLAY_STANDARD
                     a.status = self.e.AdGroupStatusEnum.ENABLED
                     a.optimized_targeting_enabled = False
+                    if topics_wanted(wave):
+                        tr = self.client.get_type("TargetRestriction")
+                        tr.targeting_dimension = self.e.TargetingDimensionEnum.TOPIC
+                        tr.bid_only = False          # Targeting (narrows reach), not Observation
+                        a.targeting_setting.target_restrictions.append(tr)
                     ops.append(op); idx.append({"t": "adgroup", "k": g["key"]})
                 if g["alcohol"] and not g["exclusion_res"] and \
                         (g["excl_attempts"] or 0) < EXCL_TRIES:
@@ -376,6 +427,17 @@ class Ads:
                     cr.negative = True
                     cr.age_range.type_ = self.e.AgeRangeTypeEnum.AGE_RANGE_18_24
                     ops.append(op); idx.append({"t": "exclusion", "k": g["key"]})
+                if topics_wanted(wave) and (g["topic_attempts"] or 0) < EXCL_TRIES:
+                    have = topics_of(g)
+                    for tc in topics:
+                        if tc in have:
+                            continue
+                        op = self._op()
+                        cr = op.ad_group_criterion_operation.create
+                        cr.ad_group = ag_res
+                        cr.status = self.e.AdGroupCriterionStatusEnum.ENABLED
+                        cr.topic.topic_constant = tc
+                        ops.append(op); idx.append({"t": "topic", "k": g["key"], "tc": tc})
                 arts = con.execute("SELECT * FROM articles WHERE adgroup_key=? AND status='planned'"
                                    " ORDER BY id", (g["key"],)).fetchall()
                 for art in arts:
@@ -442,6 +504,14 @@ class Ads:
                        "campaigns c ON g.campaign_key=c.key WHERE c.wave=? AND c.status!='failed' "
                        "AND COALESCE(g.attempts,0)<3 AND a.status='planned'", (wave,)).fetchone():
             return True
+        if topics_wanted(wave):
+            n_topics = len(config.TOPIC_PATHS)
+            for g in con.execute("SELECT g.* FROM adgroups g JOIN campaigns c ON "
+                                 "g.campaign_key=c.key WHERE c.wave=? AND c.status!='failed' AND "
+                                 "g.adgroup_res IS NOT NULL AND COALESCE(g.topic_attempts,0)<?",
+                                 (wave, EXCL_TRIES)).fetchall():
+                if len(topics_of(g)) < n_topics:
+                    return True
         for c in con.execute("SELECT * FROM campaigns WHERE wave=? AND status!='failed' AND "
                              "COALESCE(label_attempts,0)<3", (wave,)).fetchall():
             done = set(json.loads(c["labels_done"] or "[]"))
@@ -525,6 +595,21 @@ class Ads:
                                  g["campaign_key"]))
                     db._log_after_commit(con, f"campaign HELD (kept paused): 18-24 exclusion "
                                               f"failed {n} times on ad group {k}: {short(msg, 200)}")
+            elif t == "topic":
+                g = con.execute("SELECT * FROM adgroups WHERE key=?", (k,)).fetchone()
+                n = g["topic_attempts"] or 0
+                if ("topic", k) not in counted:
+                    counted.add(("topic", k))
+                    n += 1
+                con.execute("UPDATE adgroups SET error=?, topic_attempts=? WHERE key=?",
+                            (msg, n, k))
+                if n >= EXCL_TRIES:
+                    con.execute("UPDATE campaigns SET status='held', error=? WHERE key=? AND "
+                                "status IN ('planned','created')",
+                                (f"kept paused: topics could not be added ({msg})"[:500],
+                                 g["campaign_key"]))
+                    db._log_after_commit(con, f"campaign HELD (kept paused): topics failed {n} "
+                                              f"times on ad group {k}: {short(msg, 200)}")
             elif t == "adgroup":
                 g = con.execute("SELECT * FROM adgroups WHERE key=?", (k,)).fetchone()
                 n = g["attempts"] or 0
@@ -549,6 +634,11 @@ class Ads:
             if t == "campaign":
                 con.execute("UPDATE campaigns SET status='created' WHERE key=? AND "
                             "status='planned'", (k,))
+        elif t == "topic":
+            g = con.execute("SELECT * FROM adgroups WHERE key=?", (k,)).fetchone()
+            have = topics_of(g)
+            have[entry["tc"]] = resource_name
+            con.execute("UPDATE adgroups SET topics_res=? WHERE key=?", (json.dumps(have), k))
         elif t == "label":
             c = con.execute("SELECT labels_done FROM campaigns WHERE key=?", (k,)).fetchone()
             done = json.loads(c["labels_done"] or "[]")
@@ -639,12 +729,13 @@ class Ads:
         if not self.has_work(wave) or quota_left < 50:
             return 0
         self.check_collisions(wave)
+        topics = self.topic_constants() if topics_wanted(wave) else None   # before creating anything
         names = []
         for c in con.execute("SELECT * FROM campaigns WHERE wave=? AND status!='failed'", (wave,)):
             names += self.wanted_labels(c)
         label_res = self.ensure_labels(names)
         chosen_ops, index, total, nbytes_job = [], [], 0, 0
-        for key, ops, idx in self.iter_units(wave, logos, label_res):
+        for key, ops, idx in self.iter_units(wave, logos, label_res, topics):
             size = sum(op._pb.ByteSize() for op in ops)
             if total + len(ops) + 20 > quota_left:
                 break
@@ -804,7 +895,7 @@ class Ads:
         if not camps:
             return
         found = {"budget": {}, "campaign": {}, "crit": {}, "label": {}, "ag": {}, "excl": {},
-                 "asset": {}, "ad": {}}
+                 "topic": {}, "asset": {}, "ad": {}}
         names = [c["name"] for c in camps]
         for part in _chunks(names):
             q = ",".join(_q(f"{n} | budget") for n in part)
@@ -846,6 +937,16 @@ class Ads:
                                  "ad_group_criterion.negative = TRUE", "reconcile"):
                 if x.ad_group_criterion.age_range.type_.name == "AGE_RANGE_18_24":
                     found["excl"][x.ad_group.resource_name] = x.ad_group_criterion.resource_name
+            if topics_wanted(wave):
+                for x in self.search("SELECT ad_group_criterion.resource_name, "
+                                     "ad_group.resource_name, ad_group_criterion.topic.topic_constant"
+                                     f" FROM ad_group_criterion WHERE ad_group.resource_name IN ({q})"
+                                     " AND ad_group_criterion.type = 'TOPIC' AND "
+                                     "ad_group_criterion.negative = FALSE AND "
+                                     "ad_group_criterion.status != 'REMOVED'", "reconcile"):
+                    found["topic"].setdefault(x.ad_group.resource_name, {})[
+                        x.ad_group_criterion.topic.topic_constant] = \
+                        x.ad_group_criterion.resource_name
             for x in self.search("SELECT ad_group_ad.resource_name, ad_group.resource_name, "
                                  "ad_group_ad.ad.final_urls FROM ad_group_ad WHERE "
                                  f"ad_group.resource_name IN ({q}) AND ad_group_ad.status != 'REMOVED'",
@@ -894,6 +995,11 @@ class Ads:
                     if found["excl"].get(gr):
                         con.execute("UPDATE adgroups SET exclusion_res=? WHERE key=? AND "
                                     "exclusion_res IS NULL", (found["excl"][gr], g["key"]))
+                    if found["topic"].get(gr):
+                        have = topics_of(g)
+                        have.update(found["topic"][gr])
+                        con.execute("UPDATE adgroups SET topics_res=? WHERE key=?",
+                                    (json.dumps(have), g["key"]))
                     for a in arts:
                         if a["adgroup_key"] != g["key"]:
                             continue
@@ -1011,6 +1117,37 @@ class Ads:
         for ag, key in extra.items():
             hold.setdefault(key, f"ad group {ag.split('/')[-1]} in Google Ads has no 18-24 "
                                  f"exclusion (not in the database)")
+        # topics: every ad group Google has in these campaigns (even one missing from the
+        # database) must have all the topics, confirmed in Google Ads, before enabling;
+        # an ad group without them would serve across the whole Display Network
+        top_camps = {r["campaign_res"]: r["key"] for r in rows
+                     if topics_wanted(r["wave"]) and r["campaign_res"]}
+        if top_camps:
+            want = set(self.topic_constants())
+            ag_camp = {}
+            for part in _chunks(list(top_camps)):
+                qq = ",".join(_q(r) for r in part)
+                for x in self.search("SELECT campaign.resource_name, ad_group.resource_name, "
+                                     "ad_group.name FROM ad_group WHERE campaign.resource_name IN "
+                                     f"({qq}) AND ad_group.status != 'REMOVED'", "pre_enable"):
+                    ag_camp[x.ad_group.resource_name] = (top_camps[x.campaign.resource_name],
+                                                         x.ad_group.name)
+            got = {}
+            for part in _chunks(list(ag_camp)):
+                qq = ",".join(_q(r) for r in part)
+                for x in self.search("SELECT ad_group.resource_name, "
+                                     "ad_group_criterion.topic.topic_constant FROM "
+                                     f"ad_group_criterion WHERE ad_group.resource_name IN ({qq}) "
+                                     "AND ad_group_criterion.type = 'TOPIC' AND "
+                                     "ad_group_criterion.negative = FALSE AND "
+                                     "ad_group_criterion.status != 'REMOVED'", "pre_enable"):
+                    got.setdefault(x.ad_group.resource_name, set()).add(
+                        x.ad_group_criterion.topic.topic_constant)
+            for ag, (key, name) in ag_camp.items():
+                missing = want - got.get(ag, set())
+                if missing:
+                    hold.setdefault(key, f"{len(missing)} of {len(want)} topics not found in "
+                                         f"Google Ads on ad group {name}")
         for r in rows:
             if not ads_n.get(r["key"]):
                 hold.setdefault(r["key"], "no ads uploaded in this campaign")

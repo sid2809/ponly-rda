@@ -1061,6 +1061,18 @@ class Worker:
             return f"{waiting} articles still need images (none started in the last hour)"
         return f"{waiting} waiting; ~{hour}/hour now -> ~{waiting / hour:.1f} h (estimate)"
 
+    def _topic_counts(self):
+        from .gads import topics_of, topics_wanted
+        n = len(config.TOPIC_PATHS)
+        done = made = 0
+        for g in self.con.execute("SELECT g.topics_res, c.wave FROM adgroups g JOIN campaigns c "
+                                  "ON g.campaign_key=c.key WHERE g.adgroup_res IS NOT NULL AND "
+                                  "c.status!='removed'"):
+            if topics_wanted(g["wave"]):
+                made += 1
+                done += len(topics_of(g)) >= n
+        return f"{done} / {made}"
+
     def summary_rows(self):
         con = self.con
 
@@ -1129,6 +1141,7 @@ class Worker:
                  ["Campaigns HELD paused (see Campaign map > Error)",
                   count("SELECT COUNT(*) FROM campaigns WHERE status='held' OR (status='created' "
                         "AND error LIKE 'not enabled%')")],
+                 ["Ad groups with all topics / created (topic waves)", self._topic_counts()],
                  ["Ad review status (count)", json.dumps({r[0] or "-": r[1] for r in con.execute(
                      "SELECT review_status, COUNT(*) FROM articles WHERE status='uploaded' "
                      "GROUP BY review_status")})],

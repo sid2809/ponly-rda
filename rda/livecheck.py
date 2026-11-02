@@ -193,6 +193,29 @@ def run(w):
                 excl[k] = excl.get(k, 0) + 1
         dup += [f"ad x{len(v)} for {u}" for (g, u), v in ads_per.items() if len(v) > 1]
         dup += [f"18-24 exclusion x{v} on {g}" for g, v in excl.items() if v > 1]
+        # topics (waves the pipeline adds them to): duplicates, and enabled campaigns whose
+        # ad groups lack any of them
+        from .gads import topics_wanted
+        tops = {}
+        for part in _chunks(ag_res):
+            q = ",".join(_q(r) for r in part)
+            for x in ads.search("SELECT ad_group.resource_name, "
+                                "ad_group_criterion.topic.topic_constant FROM ad_group_criterion "
+                                f"WHERE ad_group.resource_name IN ({q}) AND "
+                                "ad_group_criterion.type = 'TOPIC' AND "
+                                "ad_group_criterion.negative = FALSE AND "
+                                "ad_group_criterion.status != 'REMOVED'", "livecheck"):
+                k = (x.ad_group.resource_name, x.ad_group_criterion.topic.topic_constant)
+                tops[k] = tops.get(k, 0) + 1
+        dup += [f"topic {t} x{v} on {g}" for (g, t), v in tops.items() if v > 1]
+        n_topics = len(config.TOPIC_PATHS)
+        for g in con.execute("SELECT g.adgroup_res, g.name, c.wave FROM adgroups g JOIN "
+                             "campaigns c ON g.campaign_key=c.key WHERE c.status='enabled' AND "
+                             "g.adgroup_res IS NOT NULL").fetchall():
+            if topics_wanted(g["wave"]):
+                n = len({t for (ag, t) in tops if ag == g["adgroup_res"]})
+                if n < n_topics:
+                    mism.append(f"enabled ad group {g['name']} has {n} of {n_topics} topics")
         uploaded = {r["ad_resource"] for r in con.execute(
             "SELECT ad_resource FROM articles WHERE ad_resource IS NOT NULL")}
         all_ads = {x for v in ads_per.values() for x in v}

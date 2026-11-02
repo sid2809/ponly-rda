@@ -21,6 +21,13 @@ COLL = {"campaign_budget_operation": "campaignBudgets", "campaign_operation": "c
         "ad_group_ad_operation": "adGroupAds"}
 
 
+# like Google's topic tree (path as a list of names)
+TOPICS = {71: ["", "Food & Drink"], 35: ["", "Food & Drink", "Beverages"],
+          122: ["", "Food & Drink", "Cooking & Recipes"], 5: ["", "Food & Drink", "Food"],
+          900: ["", "Food & Drink", "Food", "Baked Goods"], 901: ["", "Arts & Entertainment"]}
+TOPIC_RES = {"topicConstants/35", "topicConstants/5", "topicConstants/122"}
+
+
 class Stub:
     """Behaves like Google Ads for the calls the pipeline makes."""
 
@@ -35,11 +42,12 @@ class Stub:
         self.labels = []             # (name, status, resource)
         self.label_fail = set()
         self.enable_fail = set()
-        self.ent = {k: [] for k in ("budget", "campaign", "crit", "clabel", "ag", "agc",
+        self.ent = {k: [] for k in ("budget", "campaign", "crit", "clabel", "ag", "agc", "topic",
                                     "asset", "ad")}
         self.temp = {}
         self.removed = set()          # removed campaigns/budgets stay, like in Google Ads
         self.asset_disapproved = set()
+        self.ag_targeting = {}
 
     # ---- batch jobs
     def mutate_batch_job(self, customer_id, operation):
@@ -106,8 +114,13 @@ class Stub:
             self.ent["clabel"].append((self._ref(x.campaign), name))
         elif field == "ad_group_operation":
             self.ent["ag"].append((self._ref(x.campaign), x.name, res))
+            self.ag_targeting[res] = [(t.targeting_dimension.name, t.bid_only)
+                                      for t in x.targeting_setting.target_restrictions]
         elif field == "ad_group_criterion_operation":
-            self.ent["agc"].append((self._ref(x.ad_group), res, x.age_range.type_.name))
+            if x._pb.WhichOneof("criterion") == "topic":
+                self.ent["topic"].append((self._ref(x.ad_group), res, x.topic.topic_constant))
+            else:
+                self.ent["agc"].append((self._ref(x.ad_group), res, x.age_range.type_.name))
         elif field == "asset_operation":
             self.ent["asset"].append((x.name, res))
         elif field == "ad_group_ad_operation":
@@ -227,6 +240,13 @@ class Stub:
         if frm == "ad_group":
             return [NS(campaign=NS(resource_name=c), ad_group=NS(name=n, resource_name=r))
                     for c, n, r in e["ag"] if keep(c)]
+        if frm == "topic_constant":
+            return [NS(topic_constant=NS(resource_name=f"topicConstants/{i}", path=p))
+                    for i, p in TOPICS.items()]
+        if frm == "ad_group_criterion" and "type = 'TOPIC'" in query:
+            return [NS(ad_group=NS(resource_name=g), ad_group_criterion=NS(
+                resource_name=r, topic=NS(topic_constant=t))) for g, r, t in e["topic"]
+                if keep(g) and not (hide_removed and r in self.removed)]
         if frm == "ad_group_criterion":
             return [NS(ad_group=NS(resource_name=g), ad_group_criterion=NS(
                 resource_name=r, age_range=NS(type_=NS(name=t)))) for g, r, t in e["agc"]
@@ -272,7 +292,7 @@ class Strict:
         return call
 
 
-def setup(tmp, fail_types=(), n_articles=4):
+def setup(tmp, fail_types=(), n_articles=4, wave=1):
     config.KEEP_IMAGES = False
     config.IMG_DIR = os.path.join(tmp, "img")
     config.CUSTOMER_ID = "1"
@@ -292,7 +312,8 @@ def setup(tmp, fail_types=(), n_articles=4):
     client.get_service = lambda name, **k: Strict(stub, name)
     copy = {"headlines": ["a", "b", "c", "d", "e"], "long_headline": "l",
             "descriptions": ["1", "2", "3", "4", "5"], "image_prompt": "p"}
-    con.execute("INSERT INTO campaigns(key,wave,pool,nn,theme,name,n) VALUES('c1',1,'P',1,'T','C1',4)")
+    con.execute("INSERT INTO campaigns(key,wave,pool,nn,theme,name,n) VALUES('c1',?,'P',1,'T',"
+                "'C1',4)", (wave,))
     con.execute("INSERT INTO adgroups(key,campaign_key,nn,theme,name,n,alcohol) "
                 "VALUES('g1','c1',1,'T','G1',4,1)")
     for i in range(n_articles):

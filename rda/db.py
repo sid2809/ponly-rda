@@ -60,7 +60,9 @@ def connect(path=None):
                              ("campaigns", "enable_attempts", "INTEGER DEFAULT 0"),
                              ("articles", "review_status", "TEXT"),
                              ("articles", "asset_policy", "TEXT"),
-                             ("articles", "cost", "REAL")):
+                             ("articles", "cost", "REAL"),
+                             ("adgroups", "topics_res", "TEXT"),
+                             ("adgroups", "topic_attempts", "INTEGER DEFAULT 0")):
         have = {r[1] for r in con.execute(f"PRAGMA table_info({table})")}
         if col not in have:
             con.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
